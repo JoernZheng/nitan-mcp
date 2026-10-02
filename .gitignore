@@ -5,7 +5,16 @@ node_modules/*
 my-login.json
 cookies.json
 dist-skill/*
-.DS_STORE
+.DS_Store
 .venv/*
 .playwright-mcp/*
 .cursor/*
+# Local auth and collection artifacts
+.env
+.env.*
+!.env.example
+profile.json
+pending-auth*.json
+daily.json
+*.collection.json
+*.events/

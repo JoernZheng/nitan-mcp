@@ -1,380 +1,155 @@
-## Nitan MCP
+# Nitan MCP
 
-> **Project Homepage:** [https://nitan.ai/mcp](https://nitan.ai/mcp)
+A small, read-only MCP server for [uscardforum.com](https://www.uscardforum.com/).
+This personal fork keeps Nitan's forum adapters and selectively adopts general
+fixes from [Discourse MCP](https://github.com/discourse/discourse-mcp).
 
-[论坛开发讨论贴](https://www.uscardforum.com/t/topic/450599)
+Source: [JoernZheng/nitan-mcp](https://github.com/JoernZheng/nitan-mcp).
+The package keeps the upstream name `@nitansde/mcp` for compatibility; the npm
+release belongs to upstream. Build this repository to use our maintained code.
 
-This is a heavy modified version of [Discourse MCP](https://github.com/discourse/discourse-mcp). It will be a dedicated MCP client for https://www.uscardforum.com/
+## Install from source
 
-### Quick Installation
+Requirements: Node.js 22+, pnpm 10, and Python with the dependencies in
+`requirements.txt`. The verified local runtime uses Node 22 and Python 3.9.
 
-**Prerequisites:**
-- **Node.js 18 or higher** (required)
-- Python 3.7+ (required for Cloudflare bypass)
-- pip (used via local `.venv` Python)
-
-## Simplified setup by platform
-
-### macOS
 ```bash
-npm install
+git clone https://github.com/JoernZheng/nitan-mcp.git
+cd nitan-mcp
+pnpm install --frozen-lockfile --ignore-scripts
 python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-```
-
-`npm install` will also auto-install `playwright` and the Chromium runtime on macOS for browser fallback.
-
-### Linux
-```bash
-npm install
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-On non-macOS platforms, Playwright is not auto-installed.
-
-### Windows (PowerShell)
-```powershell
-npm install
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
-
-On non-macOS platforms, Playwright is not auto-installed.
-
-Run health check:
-```bash
+.venv/bin/python -m pip install -r requirements.txt
+pnpm build
 node dist/index.js doctor
 ```
 
-**Check your Node.js version:**
-```bash
-node --version  # Should be v18.0.0 or higher
+Configure your MCP client with absolute paths:
+
+```json
+{
+  "mcpServers": {
+    "nitan": {
+      "command": "/absolute/path/to/node",
+      "args": [
+        "/absolute/path/to/nitan-mcp/dist/index.js",
+        "--site", "https://www.uscardforum.com",
+        "--python_path", "/absolute/path/to/nitan-mcp/.venv/bin/python",
+        "--bypass_method", "curl_cffi",
+        "--browser-fallback-enabled=false",
+        "--interactive-login-enabled=false"
+      ],
+      "env": { "TIMEZONE": "America/Los_Angeles" }
+    }
+  }
+}
 ```
 
-**If you need to upgrade Node.js:**
-```bash
-# Using nvm (recommended)
-nvm install 18
-nvm use 18
+This is the verified direct-request setup. Browser recovery is optional; see
+[CLOUDFLARE_BYPASS.md](CLOUDFLARE_BYPASS.md). Stdio is the default transport.
+Optional HTTP mode (`--transport http --port 3000`) binds to loopback only.
 
-# Or download from https://nodejs.org/
+## Authentication
+
+Public topics can be read anonymously. To use your account, set
+`NITAN_USERNAME` and `NITAN_PASSWORD` in the MCP client's environment. Keep
+credentials outside this repository. A configured credential is not proof of
+successful login; confirm the actual session identity when comparing accounts.
+
+A saved User API key takes precedence over login credentials. To provision one:
+
+```bash
+node dist/index.js generate-user-api-key --site https://www.uscardforum.com \
+  --auth-mode url --state-file /absolute/private/path/pending-auth.json
+node dist/index.js complete-user-api-key \
+  --state-file /absolute/private/path/pending-auth.json --payload "ENCRYPTED_PAYLOAD"
 ```
 
-**Using npx (recommended):**
+Open the printed URL, authorize, then complete with the encrypted payload.
+The pending file contains private key material; keep it private. The server
+loads its platform profile automatically: macOS `~/Library/Application Support/NitanMCP/profile.json`,
+Linux `${XDG_CONFIG_HOME:-~/.config}/nitan-mcp/profile.json`, Windows
+`%APPDATA%\NitanMCP\profile.json`. Successful completion removes the pending file.
+
+## Tools
+
+Nine read-only tools are exposed when `--site` is set. Without it,
+`discourse_select_site` is also available. No posting, deletion or admin tools.
+
+| Tool | Purpose |
+| --- | --- |
+| `discourse_list_hot_topics` | Hot topics, with bounded page/offset continuation |
+| `discourse_list_top_topics` | Ranked topics for daily/weekly/monthly or other periods |
+| `discourse_search` | Keyword, category, author and date filters |
+| `discourse_read_topic` | Topic metadata, posts and consumed continuation cursor |
+| `discourse_get_user_activity` | Recent posts/replies by a user |
+| `discourse_list_notifications` | Notifications using configured authentication |
+| `discourse_get_trust_level_progress` | A user's level and progress |
+| `discourse_list_excellent_topics` | Topics awarded the excellent-topic badge |
+| `discourse_list_funny_topics` | Topics awarded the funny-topic badge |
+
+See [TOOLS.md](TOOLS.md) for input examples and result/coverage rules.
+
+## Efficient reading
+
+Use one persistent MCP connection. Discover topics, preview a small batch from
+each, read a local directory/chunks, then resume the important material in larger
+batches. The collector makes multiple MCP calls in one local execution; full
+post bodies stay in a snapshot instead of repeatedly filling model context.
+
 ```bash
-npx -y @nitansde/mcp@latest
+node dist/index.js collect --public --output ./daily.json --hot-limit 10 \
+  --preview --post-limit 5 --max-topics 10 --max-calls 11 --max-seconds 120
+node dist/index.js read-collection --input ./daily.json --list --limit 10
+node dist/index.js read-collection --input ./daily.json --topic 12345 \
+  --start 1 --limit 30 --max-bytes 65536
+node dist/index.js collect --public --output ./daily.json --hot-limit 10 \
+  --post-limit 300 --max-topics 10 --max-calls 20 --max-seconds 120
 ```
 
-**What happens automatically:**
-1. ✅ Downloads and caches the package
-2. ✅ Installs Node.js dependencies
-3. ✅ Runs `postinstall` script to check/install Python dependencies
-4. ✅ On macOS, auto-installs `playwright` package and Chromium runtime for browser fallback
-5. ✅ Checks Python dependencies at runtime and shows helpful warnings if missing
+Remove `--public` to use the collector's own env/profile credentials. It does
+not inherit another application's MCP env automatically. Adapter flags go after
+`--`, for example `-- --python_path /absolute/path/python --bypass_method curl_cffi`.
+Rerun the same output to resume; keep its site and author filter unchanged.
 
-**If Python dependencies aren't installed automatically:**
-```bash
-.venv/bin/python -m pip install cloudscraper curl-cffi
-# Or install from requirements.txt (recommended)
-.venv/bin/python -m pip install -r requirements.txt
-```
+Preview reads one batch per selected topic and preserves the real cursor.
+It is partial unless those topic ranges are exhausted. `--list` and chunk
+reading are local only. Directory offsets are zero-based; post numbers start at 1.
 
-**If Python is installed in a virtual environment**
-```bash
-npx -y @nitansde/mcp@latest --python_path /path/to/python_executable
-```
+Exit 0 means a completed run; exit 2 means partial/cooldown/budget stop; invalid
+input or startup failure exits 1. Inspect `reason`, `selected_topics_complete`
+and `discovery_complete`: discovery is a bounded sample, not whole-forum/day
+coverage. Same-output runs use a lock; remove a stale lock only after confirming
+its recorded PID exited. Content and cursors commit together via atomic rename.
 
-The server will start even if Python dependencies are missing, but Cloudflare bypass features won't work until you install them.
+## Limits and reliability
 
-### Skill Distribution (OpenClaw AgentSkill)
+- HTTP work is serialized per origin. Concurrent tool calls do not increase the
+  forum budget. Server pacing defaults to 500 ms; public collection to 3,000 ms.
+  Override with `--request-interval-ms` (500–60,000 ms) for bounded workloads.
+- 429/confirmed 1015 stops fallback/retry cascades. Cooldown uses server hints,
+  or 60 seconds when none are parseable; collection persists it across runs.
+- Topic reads default to 90 posts (max 500), 32 logical requests and a 262 KiB
+  result budget. Compact output avoids duplicate text. Never advance past a
+  post that was not returned; follow `next_post_number`.
+- Raw timestamps describe edits. Creation time may be unknown. Truncated bodies,
+  incomplete ranges and unreviewed attachments are marked explicitly.
+- Each collector run writes a separate safe event file. Logs omit credentials,
+  Cookies, queries and post bodies; explicit counts exclude library retries.
+- Search and normal reads have different observed limits. See
+  [the measured workflow](docs/maintenance/efficient-reading.md); the sample
+  does not establish daily or long-term quotas.
 
-This project also ships an **AgentSkill** (additive only, does **not** change MCP runtime behavior).
-
-- Skill source: `skills/nitan/SKILL.md`
-- Pack command:
-
-```bash
-pnpm skill:pack
-# output: dist-skill/nitan.skill
-```
-
-#### Install Skill in OpenClaw
-
-Option A (recommended): install the packaged file
-
-1. Build the skill package:
+## Development
 
 ```bash
-pnpm skill:pack
-```
-
-2. Import `dist-skill/nitan.skill` into OpenClaw Skill manager (or your skill distribution channel).
-
-Option B: install from source folder (local development)
-
-1. Copy `skills/nitan/` to your OpenClaw skills directory.
-2. Restart/reload OpenClaw so it re-indexes skills.
-
-Release-ready checklist:
-
-```bash
-pnpm install
 pnpm typecheck
 pnpm build
 pnpm test
 pnpm skill:pack
 ```
 
-Publish flow:
-- npm package publish remains unchanged.
-- Attach `dist-skill/nitan.skill` as a release artifact (or upload to your skill channel).
-
-### Cloudflare Bypass
-
-This server uses an intelligent **dual-method Cloudflare bypass strategy**:
-1. Tries `cloudscraper` first (mature, established)
-2. Automatically falls back to `curl_cffi` if cloudscraper fails (better browser impersonation)
-3. Remembers failures and uses the working method for subsequent requests
-
-This provides maximum reliability against Cloudflare protection. See [CLOUDFLARE_BYPASS.md](CLOUDFLARE_BYPASS.md) for details.
-
-### Browser Fallback (new)
-
-When direct bypass still hits Cloudflare challenge (403/challenge page), browser fallback is enabled by default on macOS.
-
-- Keeps current direct mode as default
-- Triggers browser path only on challenge-like responses
-- **macOS only**: default provider is Playwright persistent profile mode (`playwright`)
-- **macOS only**: `npm install` auto-installs Playwright + Chromium runtime
-- Profile selection for Playwright fallback:
-  - Reuse OpenClaw user-data-dir only when the selected profile directory exists
-  - Otherwise use/create `~/Library/Application Support/NitanMCP/ChromeProfile`
-  - If OpenClaw user-data-dir exists but the selected profile directory is missing, auto-fallback to Nitan profile dir
-  - Never use the system default Chrome profile directory
-- If fallback lands on login/not_logged_in and `NITAN_USERNAME` + `NITAN_PASSWORD` are set, Playwright auto-login is attempted and request is retried once
-- Interactive login keeps working by opening a visible Chrome window with the selected profile
-- Non-macOS: browser fallback is disabled automatically (direct bypass only), and Playwright is not auto-installed
-
-CLI flags (or profile JSON fields):
-
-- `--browser-fallback-enabled=true`
-- `--browser-fallback-provider=playwright`
-- `--browser-fallback-timeout-ms=45000`
-- `--interactive-login-enabled=true`
-- `--login-profile-name="nitan"`
-- `--login-check-url="https://www.uscardforum.com/"`
-
-Example:
-
-```bash
-npx -y @nitansde/mcp@latest \
-  --browser-fallback-enabled=true \
-  --browser-fallback-provider=playwright \
-  --interactive-login-enabled=true \
-  --login-profile-name="nitan"
-```
-
-If you switch provider to `openclaw_proxy` and relay is unavailable, attach a tab with OpenClaw Browser Relay (badge `ON`) and retry.
-
-If Playwright is missing on macOS, run:
-
-```bash
-npm install --no-save playwright
-npx playwright install chromium
-```
-
-### Python dependency recommendation (all platforms)
-
-Use local venv to avoid system Python policy conflicts (PEP668 / externally managed environments):
-
-```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-```
-
-`python_path` now defaults to `.venv/bin/python` when available.
-
-During `npm install`, postinstall now prefers local `.venv` and installs requirements via `.venv` Python/pip.
-
-### MCP Client Configuration
-### API key setup (recommended)
-
-If you want authenticated reads without storing forum login credentials in your MCP client config, generate a Discourse User API key once and save it to a profile file.
-
-#### Generate and save the API key
-
-Using the published package:
-
-```bash
-npx -y @nitansde/mcp@latest generate-user-api-key \
-  --site https://www.uscardforum.com \
-  --auth-mode url
-```
-
-Using a local checkout after `npm run build`:
-
-```bash
-node dist/index.js generate-user-api-key \
-  --site https://www.uscardforum.com \
-  --auth-mode url
-```
-
-Authorization launch modes:
-
-- `--auth-mode url` (default): print the authorization URL in the terminal and let the user open it manually.
-- `--auth-mode browser`: automatically open the authorization URL in the default browser, while still showing the URL in the terminal as a fallback.
-
-### Resumable multi-step generation (recommended for agents)
-
-If your MCP host launches a short-lived process that cannot wait for the user to paste the payload back immediately, use the resumable flow.
-
-#### Step 1: start generation and persist pending state
-
-```bash
-npx -y @nitansde/mcp@latest generate-user-api-key \
-  --site https://www.uscardforum.com \
-  --auth-mode browser \
-  --state-file /absolute/path/nitan-user-api-key.json
-```
-
-This command:
-
-1. Generates the RSA key pair and a unique client ID.
-2. Prints the authorization URL.
-3. Optionally opens the browser if `--auth-mode browser` is used.
-4. Saves the pending private/public key state to `--state-file`.
-5. Exits without waiting for the payload.
-
-#### Step 2: complete later with the payload
-
-```bash
-npx -y @nitansde/mcp@latest complete-user-api-key \
-  --state-file /absolute/path/nitan-user-api-key.json \
-  --payload "PASTE_THE_ENCRYPTED_PAYLOAD_HERE"
-```
-
-`complete-user-api-key` decrypts the payload using the saved pending state, writes the final `user_api_key` to the profile, and removes the state file on success.
-
-#### Default profile location
-
-The CLI saves the API profile to a platform default location automatically:
-
-- macOS: `~/Library/Application Support/NitanMCP/profile.json`
-- Linux / Docker: `${XDG_CONFIG_HOME:-~/.config}/nitan-mcp/profile.json`
-- Windows: `%APPDATA%\NitanMCP\profile.json`
-
-Browser-launch example:
-
-```bash
-npx -y @nitansde/mcp@latest generate-user-api-key \
-  --site https://www.uscardforum.com \
-  --auth-mode browser \
-  --state-file /absolute/path/nitan-user-api-key.json
-```
-
-What happens:
-
-1. The CLI generates a temporary RSA key pair.
-2. It prints a Discourse authorization URL.
-3. Open that URL, log into uscardforum, and authorize the application.
-4. Discourse shows an encrypted payload on the page.
-5. Copy that payload and paste it back into the terminal prompt.
-6. The CLI decrypts it and saves `user_api_key` + `user_api_client_id` into the profile file.
-
-The current flow uses the manual copy/paste payload path and requests `read` scope by default.
-
-Example saved profile:
-
-```json
-{
-  "auth_pairs": [
-    {
-      "site": "https://www.uscardforum.com",
-      "user_api_key": "YOUR_USER_API_KEY",
-      "user_api_client_id": "nitan-mcp-550e8400-e29b-41d4-a716-446655440000"
-    }
-  ]
-}
-```
-
-If you do not pass `--client-id`, the generator creates a unique `nitan-mcp-<uuid>` client ID by default.
-
-#### Use the saved API key in your MCP client
-
-The server loads the default profile location automatically. No extra path flag is needed.
-
-**For Claude Desktop (macOS/Windows):**
-```json
-{
-  "mcpServers": {
-    "nitan": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@nitansde/mcp@latest"
-      ],
-      "env": {
-        "TIMEZONE": "America/New_York"
-      }
-    }
-  }
-}
-```
-
-If an API key exists for the selected site, the server uses that first.
-
-#### Delete the current saved API key file
-
-To remove the current default saved API profile file entirely:
-
-```bash
-npx -y @nitansde/mcp@latest delete-user-api-key
-```
-
-### Login via environment variables (alternative to API key)
-
-If you do not want to use an API key, you can provide login credentials instead.
-
-```json
-{
-  "mcpServers": {
-    "nitan": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@nitansde/mcp@latest"
-      ],
-      "env": {
-        "NITAN_USERNAME": "YOUR_USERNAME",
-        "NITAN_PASSWORD": "YOUR_PASSWORD"
-      }
-    }
-  }
-}
-```
-
-Behavior summary:
-
-- API key and login credentials are alternative auth setups.
-- If an API key exists for the site, it is preferred.
-- If no API key exists but `NITAN_USERNAME` / `NITAN_PASSWORD` are configured, login mode is used.
-- If neither exists, public tools still work, but auth-required tools will ask you to set up an API key or provide `NITAN_USERNAME` / `NITAN_PASSWORD`.
-
-Use optional env `"TIMEZONE": "America/New_York"` if you want a timezone different from your local clock.
-
-**Configuration file location:**
-```
-
-**Configuration file location:**
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-```
-
-
-## Original README
-[Discourse MCP](https://github.com/discourse/discourse-mcp/blob/main/README.md)
+Read [AGENTS.md](AGENTS.md) before editing. [Maintenance status](docs/maintenance/delivery-plan.md)
+and [acceptance evidence](docs/maintenance/local-acceptance.md) explain the
+current scope. The optional [skill](skills/nitan/SKILL.md) remains a thin bridge;
+its single-call shell wrappers start a fresh process, so prefer a persistent
+MCP client or `collect` for bulk work.

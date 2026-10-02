@@ -1,3 +1,5 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -159,7 +161,7 @@ test('HTTP transport gracefully handles shutdown', async () => {
   }
 });
 
-test('health adapts to forwarded host and auth page uses manual payload flow', async () => {
+test('health ignores forwarded host and auth page uses manual payload flow', async () => {
   const port = await getFreePort();
   const indexPath = path.resolve(__dirname, '../../dist/index.js');
   const workdir = createTempDir('nitan-auth-flow-');
@@ -182,7 +184,7 @@ test('health adapts to forwarded host and auth page uses manual payload flow', a
     assert.equal(healthResponse.status, 200);
     const health = await healthResponse.json();
     assert.equal(health.authenticated, false);
-    assert.equal(health.auth_page, 'https://funnel.example.ts.net/auth');
+    assert.equal(health.auth_page, `http://localhost:${port}/auth`);
 
     const authResponse = await fetch(`http://localhost:${port}/auth`, {
       headers: {
@@ -400,6 +402,34 @@ test('DELETE auth callback clears profile auth and returns server to unauthentic
     assert.match(html, /Not Authenticated/);
   } finally {
     await stopServer(serverProcess);
+    await rm(workdir, { recursive: true, force: true });
+  }
+});
+
+
+test('real HTTP MCP handles sequential SDK requests with stateless transports', async () => {
+  const port = await getFreePort();
+  const indexPath = path.resolve(__dirname, '../../dist/index.js');
+  const workdir = createTempDir('nitan-http-sdk-');
+  const process = spawnHttpServer(indexPath, port, {
+    cwd: workdir, env: { HOME: workdir, NITAN_USERNAME: '', NITAN_PASSWORD: '', DISCOURSE_2FA_TOKEN: '' },
+    extraArgs: ['--auth_pairs=[]', '--browser-fallback-enabled=false', '--interactive-login-enabled=false'],
+  });
+  const client = new Client({ name: 'nitan-http-regression', version: '1' });
+  const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`));
+  try {
+    assert.ok(await waitForServer(port));
+    await client.connect(transport);
+    const first = await client.listTools();
+    assert.equal(first.tools.length, 9);
+    const result = await client.callTool({ name: 'discourse_list_notifications', arguments: {} });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), /authentication|auth|API key/i);
+    assert.equal((await client.listTools()).tools.length, 9);
+    const invalid = await client.callTool({ name: 'discourse_search', arguments: {} });
+    assert.equal(invalid.isError, true);
+  } finally {
+    await client.close(); await stopServer(process);
     await rm(workdir, { recursive: true, force: true });
   }
 });

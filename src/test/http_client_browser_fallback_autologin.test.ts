@@ -182,3 +182,11 @@ test("native fetch challenge escalates to browser fallback", async () => {
     await client.dispose();
   }
 });
+
+test("HTTP browser rescue passes the selected site's configured credentials",async()=>{
+  const credentials={username:"selected-site-user",password:"selected-site-password"};const client=createHttpClientForFallbackTests({loginCredentials:credentials});let browser=0,auto=0;
+  (client as any).cloudscraperClient={request:async()=>({success:true,status:403,body:"just a moment",headers:{}})};
+  (client as any).browserFallbackClient={isEnabled:()=>true,request:async()=>++browser===1?{status:200,body:'<input name="login">',finalUrl:"https://www.uscardforum.com/login",headers:{}}:{status:200,body:'{"ok":true}',headers:{"content-type":"application/json"}},maybeAutoLogin:async(_site:any,_options:any,supplied:any)=>{auto++;assert.deepEqual(supplied,credentials);return true;},dispose:async()=>{}};
+  try{assert.deepEqual(await client.get("/hot.json"),{ok:true});assert.equal(auto,1);assert.equal(browser,2);}
+  finally{await client.dispose();}
+});

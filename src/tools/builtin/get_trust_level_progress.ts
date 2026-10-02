@@ -1,3 +1,5 @@
+import { createToolRequest } from "../request.js";
+import { throwIfAborted } from "../../http/request_budget.js";
 import { z } from "zod";
 import type { RegisterFn } from "../types.js";
 
@@ -53,10 +55,12 @@ export const registerGetTrustLevelProgress: RegisterFn = (server, ctx) => {
         "Show a user's Discourse trust level progress toward the next level, with current stats vs requirements.",
       inputSchema: schema.shape,
     },
-    async ({ username }) => {
+    async ({ username }, _extra: any) => {
       try {
+        throwIfAborted(_extra?.signal);
         const { client } = ctx.siteState.ensureSelectedSite();
-        const summaryData = await (client.get(`/u/${encodeURIComponent(username)}/summary.json`) as Promise<any>);
+        const request = createToolRequest(client, _extra?.signal);
+        const summaryData = await (request(`/u/${encodeURIComponent(username)}/summary.json`) as Promise<any>);
         const summaryStats: Record<string, unknown> = summaryData?.user_summary || {};
         const summaryTrustLevel: number = summaryData?.users?.[0]?.trust_level ?? 0;
 
@@ -75,7 +79,7 @@ export const registerGetTrustLevelProgress: RegisterFn = (server, ctx) => {
         }
 
         const normalizedUsername = username.toLowerCase();
-        const dirData = await (client.get(
+        const dirData = await (request(
           `/directory_items.json?period=quarterly&order=days_visited&name=${encodeURIComponent(username)}`
         ) as Promise<any>);
 
@@ -127,7 +131,7 @@ export const registerGetTrustLevelProgress: RegisterFn = (server, ctx) => {
 
         const requirements = { ...TL_REQUIREMENTS[tierIndex] };
         if (tierIndex === 2) {
-          const siteData = await (client.get("/about.json") as Promise<any>);
+          const siteData = await (request("/about.json") as Promise<any>);
           const siteStats = siteData?.about?.stats || {};
           requirements.posts_read_count = Math.min(
             Math.floor((siteStats.posts_30_days || 0) / 4),

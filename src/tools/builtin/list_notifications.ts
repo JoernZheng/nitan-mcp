@@ -1,3 +1,6 @@
+import { RateLimitError } from "../../http/errors.js";
+import { createToolRequest } from "../request.js";
+import { throwIfAborted } from "../../http/request_budget.js";
 import { z } from "zod";
 import type { RegisterFn } from "../types.js";
 import { formatTimestamp } from "../../util/timestamp.js";
@@ -65,7 +68,9 @@ export const registerListNotifications: RegisterFn = (server, ctx) => {
     },
     async ({ limit = 30, unread_only = true }, _extra: any) => {
       try {
+        throwIfAborted(_extra?.signal);
         const { base, client } = ctx.siteState.ensureSelectedSite();
+        const request = createToolRequest(client, _extra?.signal);
         if (!ctx.siteState.hasAuthenticationConfiguredForSite(base)) {
           return {
             content: [
@@ -80,8 +85,8 @@ export const registerListNotifications: RegisterFn = (server, ctx) => {
         const maxReadLength = Number.isFinite(ctx.maxReadLength) ? ctx.maxReadLength : 50000;
         
         // Fetch notifications from the API
-        const url = `/notifications.json?limit=${limit}&recent=true&bump_last_seen_reviewable=true`;
-        const data = (await client.get(url)) as any;
+        const url = `/notifications.json?limit=${limit}&recent=true&bump_last_seen_reviewable=false`;
+        const data = (await request(url)) as any;
         
         let notifications: any[] = Array.isArray(data?.notifications) ? data.notifications : [];
         
@@ -106,10 +111,12 @@ export const registerListNotifications: RegisterFn = (server, ctx) => {
         for (const notif of notifications) {
           if (notif.notification_type === 2 && notif.topic_id && notif.post_number) {
             try {
-              const rawContent = (await client.get(`/raw/${notif.topic_id}/${notif.post_number}`)) as string;
+              const rawContent = (await request(`/raw/${notif.topic_id}/${notif.post_number}`)) as string;
               const key = `${notif.topic_id}/${notif.post_number}`;
               contentMap.set(key, rawContent.slice(0, maxReadLength));
             } catch (e) {
+              throwIfAborted(_extra?.signal);
+              if (e instanceof RateLimitError || (e as any)?.name === "AbortError" || (e as any)?.name === "TimeoutError") throw e;
               // If fetching content fails, just skip it
             }
           }

@@ -4,17 +4,19 @@
 const nodeVersion = process.versions.node;
 const majorVersion = parseInt(nodeVersion.split('.')[0], 10);
 
-if (majorVersion < 18) {
-  console.error(`Error: Node.js 18 or higher is required. You are using Node.js ${nodeVersion}.`);
+if (majorVersion < 22) {
+  console.error(`Error: Node.js 22 or higher is required. You are using Node.js ${nodeVersion}.`);
   console.error(`Please upgrade Node.js:`);
   console.error(`  - Download from https://nodejs.org/`);
-  console.error(`  - Or use nvm: nvm install 18 && nvm use 18`);
+  console.error(`  - Or use nvm: nvm install 22 && nvm use 22`);
   process.exit(1);
 }
 
 import { readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { Socket } from "node:net";
+import { LOOPBACK_HOST, HTTP_SHUTDOWN_GRACE_MS, HttpInputError, allowedHttpHosts, allowedHttpOrigins, validateLocalHeaders, rejectHttpRequest, readJsonBody } from "./http/local_server.js";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -44,8 +46,9 @@ import {
   resolveBrowserFallbackEnabled,
   resolveBrowserFallbackProvider,
 } from "./http/browser_fallback_defaults.js";
-import { registerAllTools } from "./tools/registry.js";
-import { SiteState, type AuthOverride } from "./site/state.js";
+import { createNitanServer } from "./server.js";
+import { normalizeSiteBase, sameSite } from "./util/site_url.js";
+import { SiteState, normalizeAuthOverrides, type AuthOverride } from "./site/state.js";
 
 const DEFAULT_TIMEOUT_MS = 15000;
 
@@ -69,6 +72,7 @@ const ProfileSchema = z
       )
       .optional(),
     timeout_ms: z.number().int().positive().optional().default(DEFAULT_TIMEOUT_MS),
+    request_interval_ms: z.number().int().min(500).max(60000).optional().default(500),
     concurrency: z.number().int().positive().optional().default(4),
     cache_dir: z.string().optional(),
     log_level: z.enum(["silent", "error", "info", "debug"]).optional().default("info"),
@@ -170,11 +174,12 @@ function getDefaultPythonPath(): string {
 function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>): Profile {
   // Handle simple username/password flags by creating auth_pairs entry
   let authPairs = (flags.auth_pairs as any) ?? profile.auth_pairs;
+  if (Array.isArray(authPairs)) authPairs = normalizeAuthOverrides(authPairs);
   
   // If username/password are provided via flags or environment variables, create an auth_pairs entry
   const username = (flags.username as string | undefined) ?? process.env.NITAN_USERNAME;
   const password = (flags.password as string | undefined) ?? process.env.NITAN_PASSWORD;
-  const site = (flags.site as string | undefined) ?? profile.site ?? "https://www.uscardforum.com/";
+  const site = normalizeSiteBase((flags.site as string | undefined) ?? profile.site ?? "https://www.uscardforum.com/");
   
   if (username && password && site) {
     const authEntry: AuthOverride = {
@@ -194,7 +199,7 @@ function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>):
       authPairs = [authEntry];
     } else if (Array.isArray(authPairs)) {
       // Check if there's already an entry for this site
-      const existingIndex = authPairs.findIndex((entry: any) => entry.site === site);
+      const existingIndex = authPairs.findIndex((entry: any) => sameSite(entry.site, site));
       if (existingIndex >= 0) {
         // Replace existing entry
         authPairs[existingIndex] = { ...authPairs[existingIndex], ...authEntry };
@@ -208,6 +213,7 @@ function mergeConfig(profile: Partial<Profile>, flags: Record<string, unknown>):
   const merged = {
     auth_pairs: authPairs,
     timeout_ms: ((flags.timeout_ms ?? flags["timeout-ms"]) as number | undefined) ?? profile.timeout_ms ?? DEFAULT_TIMEOUT_MS,
+    request_interval_ms: ((flags.request_interval_ms ?? flags["request-interval-ms"]) as number | undefined) ?? profile.request_interval_ms ?? 500,
     concurrency: (flags.concurrency as number | undefined) ?? profile.concurrency ?? 4,
     cache_dir: ((flags.cache_dir ?? flags["cache-dir"]) as string | undefined) ?? profile.cache_dir,
     log_level: (((flags.log_level ?? flags["log-level"]) as LogLevel | undefined) ?? (profile.log_level as LogLevel | undefined) ?? "info") as LogLevel,
@@ -451,6 +457,15 @@ async function runDoctor() {
 async function main() {
   // Check if user wants to generate a User API Key
   const args = process.argv.slice(2);
+  if (args[0] === "read-collection") {
+    await import("./collector_cli.js").then(({ runCollectionRead }) => runCollectionRead(args.slice(1)));
+    return;
+  }
+  if (args[0] === "collect") {
+    const { runCollector } = await import("./collector_cli.js");
+    await runCollector(args.slice(1));
+    return;
+  }
   if (args[0] === "doctor") {
     await runDoctor();
     return;
@@ -514,7 +529,11 @@ Options:
 
   // Meta log (stderr) without leaking secrets
   const version = await getPackageVersion();
-  logger.info(`Starting Discourse MCP v${version}`);
+  logger.info(`Starting Nitan MCP v${version}`);
+  let buildId = 'unknown';
+  try { buildId = JSON.parse(await readFile(new URL('./build-info.json', import.meta.url), 'utf8')).build_id; } catch { }
+  logger.event('server.started', { build_id: buildId, request_interval_ms: config.request_interval_ms });
+
   logger.debug(`Config: ${JSON.stringify(redactObject({ ...config }))}`);
 
   // Initialize dynamic site state
@@ -537,6 +556,7 @@ Options:
   const siteState = new SiteState({
     logger,
     timeoutMs: config.timeout_ms,
+    requestIntervalMs: config.request_interval_ms,
     defaultAuth: auth,
     authOverrides,
     bypassMethod: config.use_cloudscraper ? "both" : config.bypass_method, // Legacy support: use_cloudscraper=true => "both"
@@ -552,18 +572,6 @@ Options:
     },
   });
 
-  const server = new McpServer(
-    {
-      name: "@discourse/mcp",
-      version,
-    },
-    {
-      capabilities: {
-        tools: { listChanged: false },
-      },
-    }
-  );
-
   let hideSelectSite = false;
   if (config.site) {
     try {
@@ -575,27 +583,20 @@ Options:
     }
   }
 
-  await registerAllTools(server as any, siteState, logger, {
+  const serverOptions = {
     hideSelectSite,
     defaultSearchPrefix: config.default_search,
     maxReadLength: config.max_read_length,
-  });
+  };
 
   // Create transport based on configuration
   if (config.transport === "http") {
-    // HTTP transport using Streamable HTTP
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-
-    await server.connect(transport);
+    // SDK 1.30 requires fresh stateless server/transport for each request.
+    const requestServers = new Set<McpServer>();
 
     const startedAt = new Date().toISOString();
 
-    // Auth state for unauthenticated servers — generate keypair at startup,
-    // auth URL is built per-request using the Host header so the callback
-    // automatically matches however the client reached us (Funnel, Tailscale DNS, localhost).
+    // Manual authorization is local-only. Forwarded headers are never trusted.
     const hasAuth = Boolean(config.site && siteState.hasAuthForSite(config.site));
     let pendingAuthKeys: {
       publicKey: string;
@@ -617,14 +618,8 @@ Options:
       logger.info(`No auth configured — visit /health to get the authorization URL.`);
     }
 
-    /** Derive the external base URL from the incoming request's Host header. */
-    function getCallbackBaseUrl(req: import("node:http").IncomingMessage): string {
-      const host = req.headers["x-forwarded-host"] || req.headers.host;
-      if (host) {
-        const proto = (req.headers["x-forwarded-proto"] as string) || (host.toString().match(/\.ts\.net/) ? "https" : "http");
-        return `${proto}://${host}`;
-      }
-      return `http://localhost:${config.port}`;
+    function getCallbackBaseUrl(req: IncomingMessage): string {
+      return `http://${req.headers.host!.toLowerCase()}`;
     }
 
     function buildPendingAuthUrl(): string | null {
@@ -641,8 +636,16 @@ Options:
       );
     }
 
-    const httpServer = createServer(async (req, res) => {
-      const parsedUrl = new URL(req.url || "/", `http://localhost:${config.port}`);
+    let exiting = false;
+    let authMutationBusy = false;
+    const shutdown = new AbortController();
+    const authHandlers = new Set<Promise<void>>();
+    const sockets = new Set<Socket>();
+    const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
+      validateLocalHeaders(req, config.port);
+      if (exiting) { res.writeHead(503); res.end(); return; }
+      if (!req.url?.startsWith("/") || req.url.startsWith("//")) throw new HttpInputError(400, "Invalid request target");
+      const parsedUrl = new URL(req.url, `http://${LOOPBACK_HOST}:${config.port}`);
 
       // Health check endpoint
       if (req.method === "GET" && parsedUrl.pathname === "/health") {
@@ -750,8 +753,9 @@ Options:
 
       // Auth callback endpoint — handles GET (from Discourse) or POST (from auth page)
       if (parsedUrl.pathname === "/auth/callback" && (req.method === "GET" || req.method === "POST")) {
-        const handlePayload = async (payload: string | null) => {
-          if (!payload) {
+        const handlePayload = async (payload: unknown) => {
+          if (exiting || res.destroyed) { if (!res.destroyed) rejectHttpRequest(res, new HttpInputError(503, "HTTP server is stopping")); return; }
+          if (typeof payload !== "string" || !payload) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "error", message: "Missing payload parameter" }));
             return;
@@ -761,131 +765,167 @@ Options:
             res.end(JSON.stringify({ status: "error", message: "No pending authorization or already authorized" }));
             return;
           }
+          if (authMutationBusy) { rejectHttpRequest(res, new HttpInputError(409, "Authorization update is already in progress")); return; }
+          authMutationBusy = true;
+          const keys = pendingAuthKeys;
           try {
-            const decrypted = decryptPayload(payload, pendingAuthKeys.privateKey);
+            const decrypted = decryptPayload(payload, keys.privateKey);
             const result = JSON.parse(decrypted);
-            if (!result.key) {
+            if (typeof result?.key !== "string" || !result.key) {
               throw new Error("Invalid response: missing 'key' field");
             }
-            await saveToProfile(resolvedProfilePath, config.site, result.key, pendingAuthKeys.clientId);
+            await saveToProfile(resolvedProfilePath, config.site, result.key, keys.clientId);
+            if (exiting) { rejectHttpRequest(res, new HttpInputError(503, "HTTP server is stopping")); return; }
             // 热更新内存中的 auth，无需重启
             siteState.updateAuthOverride({
               site: config.site,
               user_api_key: result.key,
-              user_api_client_id: pendingAuthKeys.clientId,
+              user_api_client_id: keys.clientId,
             });
             siteState.selectSite(config.site);
             logger.info(`Authorization successful — saved to ${resolvedProfilePath}`);
             pendingAuthKeys = null;
+            if (res.destroyed) return;
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "ok", message: "Authorization successful. Auth is now active." }));
           } catch (error: any) {
-            logger.error(`Auth callback error: ${error?.message || String(error)}`);
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "error", message: error?.message || "Failed to process authorization" }));
-          }
+            logger.error("Auth callback failed");
+            rejectHttpRequest(res, new HttpInputError(500, "Failed to process authorization"));
+          } finally { authMutationBusy = false; }
         };
 
         if (req.method === "GET") {
           await handlePayload(parsedUrl.searchParams.get("payload"));
         } else {
-          let body = "";
-          req.on("data", (chunk) => { body += chunk; });
-          req.on("end", async () => {
-            try {
-              const parsed = JSON.parse(body);
-              await handlePayload(parsed.payload);
-            } catch {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "error", message: "Invalid JSON body" }));
-            }
-          });
+          const parsed = await readJsonBody(req, { signal: shutdown.signal });
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new HttpInputError(400, "Expected a payload object");
+          await handlePayload((parsed as { payload?: unknown }).payload);
         }
         return;
       }
 
       // Logout endpoint — removes auth for the current site from profile
       if (req.method === "DELETE" && parsedUrl.pathname === "/auth/callback") {
+        if (authMutationBusy) { rejectHttpRequest(res, new HttpInputError(409, "Authorization update is already in progress")); return; }
+        authMutationBusy = true;
         try {
           const profileTxt = await readFile(resolvedProfilePath, "utf8").catch(() => "{}");
+          if (exiting || res.destroyed) { rejectHttpRequest(res, new HttpInputError(503, "HTTP server is stopping")); return; }
           const profile = JSON.parse(profileTxt);
           if (profile.auth_pairs && Array.isArray(profile.auth_pairs)) {
-            profile.auth_pairs = profile.auth_pairs.filter((p: any) => p.site !== config.site);
+            profile.auth_pairs = profile.auth_pairs.filter((p: any) => !sameSite(p?.site, config.site));
             await writeFile(resolvedProfilePath, JSON.stringify(profile, null, 2), "utf8");
           }
+          if (exiting) { rejectHttpRequest(res, new HttpInputError(503, "HTTP server is stopping")); return; }
           const keyPair = generateKeyPair();
           const nonce = Date.now().toString();
           const clientId = generateClientId();
           // 清除内存中的 auth
-          if (config.site) siteState.removeAuthOverride(config.site);
+          if (config.site) { siteState.removeAuthOverride(config.site); siteState.selectSite(config.site); }
           pendingAuthKeys = { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey, nonce, clientId };
+          if (res.destroyed) return;
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "ok", message: "Logged out" }));
         } catch (error: any) {
-          logger.error(`Logout error: ${error?.message || String(error)}`);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "error", message: "Logout failed" }));
-        }
+          logger.error("Logout failed");
+          rejectHttpRequest(res, new HttpInputError(500, "Logout failed"));
+        } finally { authMutationBusy = false; }
         return;
       }
 
       // MCP endpoint - handle via StreamableHTTPServerTransport
       if (parsedUrl.pathname === "/mcp" || parsedUrl.pathname === "/") {
-        let body = "";
-        req.on("data", (chunk) => {
-          body += chunk;
-        });
-        req.on("end", async () => {
-          try {
-            const parsedBody = body ? JSON.parse(body) : undefined;
-            await transport.handleRequest(req, res, parsedBody);
-          } catch (error) {
-            logger.error(`Request handling error: ${error}`);
-            if (!res.headersSent) {
-              res.writeHead(500, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "Internal server error" }));
-            }
+        let cleanup: (() => void) | undefined;
+        try {
+          if (exiting) { res.writeHead(503); res.end(); return; }
+          const parsedBody = await readJsonBody(req, { signal: shutdown.signal });
+          if (exiting || res.destroyed) { if (!res.destroyed) rejectHttpRequest(res, new HttpInputError(503, "HTTP server is stopping"), true); return; }
+          const server = await createNitanServer(siteState, logger, version, serverOptions);
+          if (exiting || res.destroyed) {
+            await server.close();
+            if (!res.destroyed) { res.writeHead(503); res.end(); }
+            return;
           }
-        });
+          const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true, enableDnsRebindingProtection: true, allowedHosts: allowedHttpHosts(config.port), allowedOrigins: allowedHttpOrigins(config.port) });
+          requestServers.add(server);
+          let closing: Promise<void> | undefined;
+          cleanup = () => {
+            closing ??= server.close()
+              .catch(() => logger.error("MCP request cleanup failed"))
+              .finally(() => requestServers.delete(server));
+          };
+          res.once("close", cleanup);
+          if (res.destroyed) { cleanup(); return; }
+          await server.connect(transport);
+          if (res.destroyed) { await server.close(); return; }
+          await transport.handleRequest(req, res, parsedBody);
+        } catch (error) {
+          cleanup?.();
+          if (!(error instanceof HttpInputError)) logger.error("MCP request handling failed");
+          rejectHttpRequest(res, error instanceof HttpInputError ? error : new HttpInputError(500, "Internal server error", -32603), true);
+        }
+
         return;
       }
 
       // Unknown endpoint
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not found" }));
+    };
+    const httpServer = createServer((req, res) => {
+      const operation = handleRequest(req, res);
+      let authRequest = false;
+      try { authRequest = new URL(req.url || "/", `http://${LOOPBACK_HOST}:${config.port}`).pathname === "/auth/callback"; } catch {}
+      if (authRequest) authHandlers.add(operation);
+      void operation.catch(error => {
+        if (!(error instanceof HttpInputError)) logger.error("HTTP request handling failed");
+        const mcp = req.url?.split("?")[0] === "/mcp" || req.url?.split("?")[0] === "/";
+        rejectHttpRequest(res, error instanceof HttpInputError ? error : new HttpInputError(500, "Internal server error", -32603), mcp);
+      }).finally(() => authHandlers.delete(operation));
     });
+    httpServer.on("connection", socket => { sockets.add(socket); socket.once("close", () => sockets.delete(socket)); });
 
-    httpServer.listen(config.port, () => {
-      logger.info(`HTTP transport listening on port ${config.port}`);
+    httpServer.listen(config.port, LOOPBACK_HOST, () => {
+      logger.info(`HTTP transport listening on ${LOOPBACK_HOST}:${config.port}`);
       logger.info(`Health check available at http://localhost:${config.port}/health`);
       logger.info(`MCP endpoint available at http://localhost:${config.port}/mcp`);
-      if (pendingAuthKeys) {
-        logger.info(`Auth page at http://localhost:${config.port}/auth`);
-      }
+      if (pendingAuthKeys) logger.info(`Auth page at http://localhost:${config.port}/auth`);
     });
 
     // Exit cleanly on SIGTERM/SIGINT
-    let exiting = false;
     const onExit = () => {
       if (exiting) return;
       exiting = true;
+      shutdown.abort();
+      const forcedExit = setTimeout(() => {
+        for (const socket of sockets) socket.destroy();
+        logger.error("HTTP shutdown exceeded cleanup grace");
+        process.exit(1);
+      }, HTTP_SHUTDOWN_GRACE_MS);
       void (async () => {
-        await siteState.dispose();
-        await new Promise<void>((resolve) => {
-          httpServer.close(() => resolve());
-        });
-        await transport.close();
+        const listenerClosed = new Promise<void>(resolve => httpServer.close(() => resolve()));
+        httpServer.closeIdleConnections();
+        await Promise.allSettled([...requestServers].map(server => server.close()).concat([siteState.dispose(), ...authHandlers]));
+        // SDK close can leave an unsent JSON response pending. Backend work
+        // is stopped by SiteState.dispose; do not wait on that response promise.
+        // Finish committed auth writes first, then close our HTTP connections.
+        for (const socket of sockets) socket.destroy();
+        await listenerClosed;
+        clearTimeout(forcedExit);
         logger.info("HTTP server closed");
         process.exit(0);
-      })().catch((e) => {
-        logger.error(`HTTP shutdown error: ${e?.message || String(e)}`);
+      })().catch(() => {
+        clearTimeout(forcedExit);
+        for (const socket of sockets) socket.destroy();
+        logger.error("HTTP shutdown failed");
         process.exit(1);
       });
     };
     process.on("SIGTERM", onExit);
     process.on("SIGINT", onExit);
   } else {
-    // Default stdio transport
+    // Default stdio transport uses one long-lived MCP server.
+    const server = await createNitanServer(siteState, logger, version, serverOptions);
     const transport = new StdioServerTransport();
 
     // Exit cleanly on stdin close or SIGTERM

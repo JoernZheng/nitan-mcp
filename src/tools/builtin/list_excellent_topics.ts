@@ -1,3 +1,5 @@
+import { createToolRequest } from "../request.js";
+import { throwIfAborted } from "../../http/request_budget.js";
 import { z } from "zod";
 import type { RegisterFn } from "../types.js";
 import { formatTimestamp } from "../../util/timestamp.js";
@@ -25,10 +27,12 @@ export const registerListExcellentTopics: RegisterFn = (server, ctx, _opts) => {
     },
     async ({ limit = 20 }, _extra: any) => {
       try {
+        throwIfAborted(_extra?.signal);
         const { base, client } = ctx.siteState.ensureSelectedSite();
+        const request = createToolRequest(client, _extra?.signal);
 
         // Badge ID 20 is for "精彩的话题" (Excellent Topic - 50 likes)
-        const data = (await client.get(
+        const data = (await request(
           `/user_badges.json?badge_id=20`
         )) as any;
 

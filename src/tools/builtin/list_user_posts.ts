@@ -1,3 +1,5 @@
+import { createToolRequest } from "../request.js";
+import { throwIfAborted } from "../../http/request_budget.js";
 import { z } from "zod";
 import type { RegisterFn } from "../types.js";
 import { formatTimestamp } from "../../util/timestamp.js";
@@ -18,11 +20,13 @@ export const registerListUserPosts: RegisterFn = (server, ctx) => {
     },
     async ({ username, page }, _extra: any) => {
       try {
+        throwIfAborted(_extra?.signal);
         const { base, client } = ctx.siteState.ensureSelectedSite();
+        const request = createToolRequest(client, _extra?.signal);
         const offset = (page || 0) * 30;
 
         // The filter parameter 4,5 corresponds to posts and replies
-        const data = (await client.get(
+        const data = (await request(
           `/user_actions.json?offset=${offset}&username=${encodeURIComponent(username)}&filter=4,5`
         )) as any;
 

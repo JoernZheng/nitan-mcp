@@ -617,7 +617,7 @@ test("auto-login is attempted with NITAN env credentials and skipped when env is
   }
 });
 
-test("recovers from singleton lock by terminating locked profile process and relaunching", async () => {
+test("profile lock requires manual close and never terminates an existing browser", async () => {
   const restorePlatform = overridePlatform("darwin");
   const originalHome = process.env.HOME;
   const homeDir = mkdtempSync(join(tmpdir(), "nitan-playwright-lock-recovery-"));
@@ -641,13 +641,10 @@ test("recovers from singleton lock by terminating locked profile process and rel
     const nitanProfileDir = join(homeDir, "Library", "Application Support", "NitanMCP", "ChromeProfile", "nitan");
     mkdirSync(nitanProfileDir, { recursive: true });
 
-    const response = await client.request({ url: "https://example.com/lock-recovery", method: "GET" });
-
-    assert.equal(response.status, 200);
-    assert.equal(response.finalUrl, "https://example.com/lock-recovery");
-    assert.equal(terminateCalls, 1);
-    assert.equal(fakePlaywright.stats.launchPersistentContextCalls, 2);
-    assert.equal(fakePlaywright.stats.newPageCalls, 1);
+    await assert.rejects(client.request({ url: "https://example.com/lock-recovery", method: "GET" }), /Close its Chrome window/);
+    assert.equal(terminateCalls, 0);
+    assert.equal(fakePlaywright.stats.launchPersistentContextCalls, 1);
+    assert.equal(fakePlaywright.stats.newPageCalls, 0);
   } finally {
     await client.dispose();
     process.env.HOME = originalHome;

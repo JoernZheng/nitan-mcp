@@ -10,9 +10,9 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "tsc -p tsconfig.json && npm run copy:python",
+    "build": "tsc -p tsconfig.json && npm run copy:python && node scripts/build-info.mjs",
     "skill:pack": "bash scripts/package-skill.sh",
-    "copy:python": "mkdir -p dist/http && cp src/http/cloudscraper_wrapper.py dist/http/ && cp src/http/curl_cffi_wrapper.py dist/http/ && cp requirements.txt dist/",
+    "copy:python": "mkdir -p dist/http && cp src/http/cloudscraper_wrapper.py dist/http/ && cp src/http/curl_cffi_wrapper.py dist/http/ && cp src/http/request_support.py dist/http/ && cp requirements.txt dist/",
     "postinstall": "node scripts/check-python-deps.mjs",
     "prepublishOnly": "pnpm run build",
     "dev": "node --enable-source-maps dist/index.js",
@@ -31,16 +31,21 @@
     "scripts/package-skill.sh",
     "skills/**",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/build-info.mjs",
+    "TOOLS.md",
+    "CLOUDFLARE_BYPASS.md",
+    "AGENTS.md",
+    "docs/maintenance/*.md"
   ],
   "publishConfig": {
     "access": "public"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

@@ -1,3 +1,6 @@
+import { toolErrorMetadata } from "../result.js";
+import { createToolRequest } from "../request.js";
+import { throwIfAborted } from "../../http/request_budget.js";
 import { z } from "zod";
 import type { RegisterFn } from "../types.js";
 import { getCategoryByName } from "../categories.js";
@@ -80,7 +83,9 @@ export const registerSearch: RegisterFn = (server, ctx) => {
       }
       q.set("q", fullQuery);
       try {
-        const data = (await client.get(`/search.json?${q.toString()}`)) as any;
+        throwIfAborted(_extra?.signal);
+        const request = createToolRequest(client, _extra?.signal);
+        const data = (await request(`/search.json?${q.toString()}`)) as any;
         const topics: any[] = data?.topics || [];
         const posts: any[] = data?.posts || [];
 
@@ -123,9 +128,14 @@ export const registerSearch: RegisterFn = (server, ctx) => {
           return result;
         });
         const text = JSON.stringify(jsonOutput, null, 2);
-        return { content: [{ type: "text", text }] };
+        return { content: [{ type: "text", text }], structuredContent: { site: base, topics: jsonOutput,
+          pagination: { request_count: 1, returned_count: jsonOutput.length, available_count: topics.length,
+            truncated: topics.length > jsonOutput.length,
+            has_more: topics.length > jsonOutput.length ? true : typeof data?.grouped_search_result?.more_full_page_results === "boolean" ? data.grouped_search_result.more_full_page_results : null,
+            coverage: "search_endpoint_page" },
+        } };
       } catch (e: any) {
-        return { content: [{ type: "text", text: `Search failed: ${e?.message || String(e)}` }], isError: true };
+        return { content: [{ type: "text", text: `Search failed: ${e?.message || String(e)}` }], isError: true, structuredContent: toolErrorMetadata(e) };
       }
     }
   );

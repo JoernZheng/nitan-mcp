@@ -1,165 +1,114 @@
-## Nitan MCP — Agent Guide
+# Nitan MCP maintenance
 
-### What this project is
-- **Purpose**: a dedicated MCP server/CLI for **https://www.uscardforum.com/** with Cloudflare-aware request handling.
-- **Package / bin**: `@nitansde/mcp` → `nitan-mcp`
-- **Entry point**: `src/index.ts` → `dist/index.js`
-- **Runtime**: Node.js 18+, `@modelcontextprotocol/sdk`, Zod
-- **Default site**: `https://www.uscardforum.com/`
+## Scope and workflow
 
-This repo started from Discourse MCP, but the current project is opinionated for uscardforum.com and should be documented and operated as such.
+This is a small personal, read-only server for uscardforum.com. Retain the
+site/auth/Python/browser adaptation and avoid admin/workflow/remote frameworks,
+new databases, schedulers or services. Read current
+`docs/maintenance/delivery-plan.md` and `upstream-assessment.md` before changes.
+Use one implementation writer; auxiliary agents review read-only snapshots.
+Preserve unrelated work and stage exact files only. Update accepted decisions
+and current validation, then make coherent local commits. Publication/config
+permissions are scoped to the caller's current authorization.
 
-### Current runtime model
-- **Built-in tools only**. Remote `/ai/tools` discovery/execution has been removed.
-- **Transport**:
-  - `stdio` (default)
-  - `http` (optional)
-- **Site selection**:
-  - `--site <url>` tethers the server to one site and hides `discourse_select_site`
-  - `discourse_select_site` can select a site interactively when not tethered
-  - site selection no longer pre-validates with `/about.json`
+The user ended live testing. Publication/install closeout must not continue
+forum workloads. Never commit credentials, profiles, cookies, forum dumps,
+machine-specific paths or logs. Keep detailed historical records local.
 
-### Authentication model
-Public read-only use is allowed, but some endpoints behave better or only work when authenticated.
+## Architecture
 
-Current preference order:
-1. **API key first**
-   - If a site has `user_api_key` / `user_api_client_id` in `auth_pairs`, that auth is used.
-2. **Login credentials second**
-   - If no API key exists but login credentials are configured, login-based bypass/browser recovery can use them.
-3. **Neither configured**
-   - Public tools may still work.
-   - Auth-required tools should prompt the user to configure an API key or `NITAN_USERNAME` / `NITAN_PASSWORD`.
+- Node 22+, SDK pinned to 1.30.0 in both lockfiles, Zod. Build with pnpm.
+- `src/index.ts`: CLI/config; `src/server.ts`: small shared factory.
+- `src/site/state.ts`: exact-site clients/auth; `src/http/client.ts`: shared
+  request path; `src/tools/registry.ts`: ordered `READ_TOOL_CATALOG`.
+- Stdio owns one persistent server. HTTP creates a fresh stateless SDK
+  server/transport per request while sharing SiteState. Never reuse a stateless
+  SDK transport or dispose shared clients when one response closes.
+- Nine registered read tools when tethered; `discourse_select_site` is added
+  when untethered. No remote `/ai/tools`, write or admin execution.
+- Keep tool names, defaults and existing text outputs stable; structured
+  results and optional controls are additive. Update README/TOOLS when schemas
+  or registration change. Unregistered legacy source files are not tools.
 
-Important behavior:
-- API auth and login creds can both be attached to the same site client.
-- API headers remain primary on requests.
-- Login credentials remain available for bypass/browser rescue paths.
-- Browser fallback is a **rescue path**, not the primary auth mode.
+## Requests, authentication and cleanup
 
-### Auth setup flows
-#### 1) API key setup (recommended)
-- Start interactive/manual flow:
-  - `nitan-mcp generate-user-api-key --site https://www.uscardforum.com`
-- Choose launch behavior:
-  - `--auth-mode url` → print URL only
-  - `--auth-mode browser` → print URL and open browser automatically
-- Default client IDs are generated as `nitan-mcp-<uuid>`.
-- The profile is saved to a platform default location and loaded automatically by the server.
+- API/User API headers take precedence; preserve login credentials as recovery
+  fields. Browser fallback is optional rescue, not primary authentication.
+- Normalize exact HTTP(S) forum bases with `util/site_url.ts`, preserving
+  subdirectories. Reject embedded URL credentials and initial requests outside
+  the selected base. No root/sibling credential inheritance. Keep API/login
+  fields when merging equivalent overrides; explicit config wins.
+- Python/bootstrap/form steps use the selected base. Recheck browser boundaries
+  after awaits before sending auth/filling/submitting. This is not a general
+  redirect interception framework.
+- Logical requests share one serialized per-origin queue, including fallback.
+  Server default 500 ms; public collector 3,000 ms. Keep serialization even when
+  independent SDK tool calls are submitted concurrently.
+- HTTP 429/confirmed 1015 propagates timing and stops backend/login/cookie retry
+  cascades. Preserve metadata when response body reading fails. Explicit
+  Retry-After/Discourse hints win; unparseable hints fall back to 60 s.
+- Only confirmed HTML/header challenges allow one anonymous/session warmup
+  retry; normal JSON/raw text mentioning challenges is not evidence. Preserve
+  first-login bootstrap and the packaged shared `request_support.py` helper.
+- Queueing/fallback share a total deadline. MCP signals reach active reads.
+  Cancellation waits for actual Python child close and never starts a successor
+  backend. Browser/login steps use remaining budget, invalidate late sessions
+  and close only owned resources. Hung browsers have no claimed hard deadline.
+- Browser adapter runs one operation at a time. Never kill existing Chrome on
+  profile lock. Relay creates its own request tab, never borrows/navigates/closes
+  another tab/context; unsupported newPage fails before forum requests.
+- Site invalidation retires clients; terminal SiteState disposal waits for both
+  current and retiring clients. Logout reselects tethered public site.
 
-#### 2) Resumable API key setup
-Useful for agent hosts that cannot keep the generator process open.
+## Local HTTP
 
-- Start and persist pending state:
-  - `nitan-mcp generate-user-api-key --site https://www.uscardforum.com --state-file /tmp/nitan-user-api-key.json`
-- Complete later in another process:
-  - `nitan-mcp complete-user-api-key --state-file /tmp/nitan-user-api-key.json --payload "..."`
+Bind 127.0.0.1 only. Every route uses exact loopback Host/Origin checks, ignoring
+forwarded headers. Shared POST reader:4 MiB/15 s, JSON 400, overflow 413, timeout 408.
+Use normalized paths for auth tracking. Committed profile writes must sync
+memory even after response disconnect. Shutdown waits for auth/backend cleanup;
+two-second grace failure exits 1. Separate stateless POSTs cannot route MCP
+cancellation to another POST's active handler. Validate real multi-request HTTP
+protocol behavior when changing lifecycle, not just health endpoints.
 
-Pending state stores the RSA private key, public key, site, nonce, and client ID. On successful completion the CLI attempts to delete the state file.
+## Reading and collection contracts
 
-Default profile path:
-- macOS: `~/Library/Application Support/NitanMCP/profile.json`
-- Linux / Docker: `${XDG_CONFIG_HOME:-~/.config}/nitan-mcp/profile.json`
-- Windows: `%APPDATA%\NitanMCP\profile.json`
+- Raw topic headers are edit times, never creation times. Unknown creation is
+  empty/unknown; JSON can enrich dates without another request. Preserve
+  truncation, attachment/quote source references and unreviewed-media status.
+- Advance cursors only past consumed posts, not loaded pages. Unconsumed observed
+  posts override stale highest. Sparse/deleted floors and unknown/nonadvancing
+  tails must not create skips or false completion. Author filters do not change
+  the meaning of remaining topic range. Bound positioning and request count.
+- Read Topic defaults:90 posts/max 500,32 logical requests,262,144 result bytes.
+  Compact avoids duplicate bodies. A post that cannot fit is unconsumed; errors
+  retain bounded consumed content/cursor when possible.
+- `collect` uses one persistent stdio client; all forum access goes through MCP.
+  Content/cursor commit together by atomic rename; deduplicate floors, preserve
+  site/filter binding and cooldown. Same-output wx lock requires checking the
+  recorded PID exited before stale-lock removal; never kill an unrelated PID.
+- Call/topic/time/output budgets include initialization. Save discovered IDs
+  before continuation; prioritize unfinished/never-started work. Discovery
+  coverage and selected-thread completion are separate. Reserve status/cooldown
+  space. First-post refresh reserves a tail call and never rewinds the cursor.
+- `--preview`:one read batch per selected topic, skip extra first-post refresh,
+  save real cursor and mark partial accurately. Removing it resumes full mode;
+  snapshots are not bound to a preview mode. Error/budget/unknown-tail wins.
+- `read-collection --list`:bounded local directory, no bodies/server; zero-based
+  offsets separate from one-based post starts. Label author-filter scope. Local
+  chunks fail explicitly if the first stored post cannot fit.
+- Public collection clears auth and rejects credential flags. All CLI wrappers
+  wait for owned child close; isError exits nonzero. No scheduler is implicit.
+- Conservatively migrate v1 raw timestamps to edit time in v2 snapshots.
 
-#### 3) Login credentials (alternative to API key)
-You can configure login credentials via:
-- env vars: `NITAN_USERNAME`, `NITAN_PASSWORD`
-- or per-site `auth_pairs` entries with `username` / `password`
+## Logs and verification
 
-### Browser fallback / Cloudflare strategy
-- Direct request path prefers Python bypass helpers:
-  - `cloudscraper`
-  - `curl_cffi`
-- When direct paths hit Cloudflare challenge pages, browser fallback can take over.
-- On macOS, Playwright browser fallback is enabled by default.
-- Browser fallback preserves auth headers on GET requests that need them.
-- Native fetch challenge responses escalate into browser fallback.
+Use only fixed allowlisted Logger.event fields. Never log raw errors, headers,
+Cookies, bodies, queries, usernames or credentials. Each collector run has its
+own UUID JSON event file and reports status after cleanup. Missing Python or
+browser costs are unknown; explicit counts exclude library-internal requests.
+Package build identity and Python helpers, never machine data.
 
-Login behavior inside browser fallback:
-- If a login page is reached and login credentials are configured, auto-login is attempted.
-- If not, the user may need to complete login manually in the browser.
-
-### HTTP transport endpoints
-When `--transport http` is used:
-- `GET /health`
-  - returns status, uptime, auth state, and auth page URL
-- `GET /auth`
-  - local auth page for the manual payload flow
-- `POST /auth/callback`
-  - accepts `{ payload }` JSON body
-- `GET /auth/callback?payload=...`
-  - accepts payload as query param
-- `DELETE /auth/callback`
-  - clears saved auth for the current site and regenerates pending auth state
-
-The `/auth` page currently uses the **manual copy/paste payload flow** (no `auth_redirect`) because that is the path proven to work on uscardforum.com.
-
-### Currently registered built-in tools
-The current runtime registers these built-in tools:
-
-- `discourse_select_site`
-- `discourse_search`
-- `discourse_read_topic`
-- `discourse_get_user_activity`
-- `discourse_list_hot_topics`
-- `discourse_list_notifications`
-- `discourse_list_top_topics`
-- `discourse_list_excellent_topics`
-- `discourse_list_funny_topics`
-- `discourse_get_trust_level_progress`
-
-Notes:
-- Write tools have been removed from this repo.
-- Some older builtin source files may still exist in `src/tools/builtin`, but if they are not registered in `src/tools/registry.ts`, they are not part of the active runtime surface.
-
-### Key CLI/config fields that matter now
-Important runtime flags / profile fields:
-- `--site <url>`
-- `--auth_pairs <json>`
-- `--transport stdio|http`
-- `--port <number>`
-- `--timeout_ms <number>`
-- `--default-search <prefix>`
-- `--max-read-length <number>`
-- `--python_path <path>`
-- `--bypass_method cloudscraper|curl_cffi|both`
-- `--browser_fallback_enabled <bool>`
-- `--browser_fallback_provider playwright|openclaw_proxy`
-- `--browser_fallback_timeout_ms <number>`
-- `--interactive_login_enabled <bool>`
-- `--login_profile_name <name>`
-- `--login_wait_timeout_ms <number>`
-- `--login_check_url <url>`
-
-Delete the current default profile file with:
-- `nitan-mcp delete-user-api-key`
-
-### Source map
-- CLI/server entrypoint: `src/index.ts`
-- API key generator / resumable flow: `src/user-api-key-generator.ts`
-- Site/auth selection: `src/site/state.ts`
-- HTTP client: `src/http/client.ts`
-- Browser fallback: `src/http/browser_fallback.ts`
-- Built-in tool registry: `src/tools/registry.ts`
-- Built-in tools: `src/tools/builtin/*`
-- Tests:
-  - `src/test/tools.test.ts`
-  - `src/test/transport.test.ts`
-  - `src/test/user_api_key_generator.test.ts`
-  - browser fallback tests in `src/test/browser_fallback_*.test.ts`
-
-### Operator quick start
-- Build: `pnpm build`
-- Test: `pnpm test`
-- Doctor: `node dist/index.js doctor`
-- Run stdio server: `node dist/index.js`
-- Run HTTP server: `node dist/index.js --transport http --port 3000`
-
-### Maintenance notes for future edits
-- If you change the registered tool set, update this file and `README.md` together.
-- If you change auth precedence, update:
-  - `src/site/state.ts`
-  - `src/http/client.ts`
-  - auth setup sections in `README.md`
-- If you reintroduce any remote tool execution feature, document it explicitly here; assume it is absent unless the current code says otherwise.
+Run relevant checks and required typecheck/build/full suite for code changes;
+validate actual SDK/CLI/packaged contracts and obtain independent review. Avoid
+repeating completed tests without a new change or unresolved concern. Docs-only
+closeout needs link/schema/diff checks plus zero-forum startup/registration.

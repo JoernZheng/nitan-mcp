@@ -1,9 +1,16 @@
+import { normalizeSiteBase, resolveSiteUrl } from "../util/site_url.js";
+import { createHash, randomUUID } from "node:crypto";
+import { HttpError, RateLimitError } from "./errors.js";
+export { HttpError, RateLimitError } from "./errors.js";
+import { createRequestBudget, throwIfAborted, cancellationError, type RequestBudget } from "./request_budget.js";
+import { withSiteRequest, recordRateLimit, assertNotCoolingDown, delay as retrySleep } from "./rate_limit.js";
 import { Logger } from "../util/logger.js";
 import { CloudscraperClient } from "./cloudscraper.js";
 import { CurlCffiClient } from "./curl_cffi.js";
 import {
   BrowserFallbackClient,
   BrowserFallbackRelayUnavailableError,
+  BrowserSiteBoundaryError,
   type BrowserFallbackOptions,
 } from "./browser_fallback.js";
 
@@ -17,6 +24,7 @@ export type BypassMethod = "cloudscraper" | "curl_cffi" | "both";
 export interface HttpClientOptions {
   baseUrl: string;
   timeoutMs: number;
+  requestIntervalMs?: number;
   logger: Logger;
   auth: AuthMode;
   useCloudscraper?: boolean; // Use Python cloudscraper to bypass Cloudflare (deprecated, use bypassMethod)
@@ -30,15 +38,16 @@ export interface HttpClientOptions {
   browserFallback?: BrowserFallbackOptions;
 }
 
-export class HttpError extends Error {
-  constructor(public status: number, message: string, public body?: unknown) {
-    super(message);
-    this.name = "HttpError";
-  }
-}
-
 export class HttpClient {
   private base: URL;
+  private disposed = false;
+  private readonly activeControllers = new Set<AbortController>();
+  private readonly pendingRequests = new Set<Promise<unknown>>();
+  private activeRequestId?: string;
+  private backendAttempts = 0;
+  private explicitCalls = 0;
+  private warmupCalls = 0;
+  private countsKnown = true;
   // Mimics Microsoft Edge browser on Windows to avoid bot detection
   private userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36 Edg/141.0.0.0";
   private cache = new Map<string, { value: any; expiresAt: number }>();
@@ -51,8 +60,8 @@ export class HttpClient {
   private browserFallbackClient?: BrowserFallbackClient;
 
   constructor(private opts: HttpClientOptions) {
-    this.base = new URL(opts.baseUrl);
-    
+    this.base = new URL(normalizeSiteBase(opts.baseUrl) + "/");
+
     // Determine bypass method (support legacy useCloudscraper option)
     if (opts.bypassMethod) {
       this.bypassMethod = opts.bypassMethod;
@@ -62,25 +71,22 @@ export class HttpClient {
     } else {
       this.bypassMethod = "both"; // Default to both with fallback
     }
-    
+
     // Initialize bypass clients based on method
     if (this.bypassMethod === "cloudscraper" || this.bypassMethod === "both") {
       this.cloudscraperClient = new CloudscraperClient(opts.logger, opts.pythonPath);
-      this.opts.logger.info("Cloudscraper initialized for Cloudflare bypass");
+
     }
     if (this.bypassMethod === "curl_cffi" || this.bypassMethod === "both") {
       this.curlCffiClient = new CurlCffiClient(opts.logger, opts.pythonPath);
-      this.opts.logger.info("curl_cffi initialized for Cloudflare bypass");
+
     }
-    
+
     // Log the active bypass strategy
-    if (this.bypassMethod === "both") {
-      this.opts.logger.info("Using dual bypass strategy: cloudscraper with curl_cffi fallback");
-    }
 
     if (opts.browserFallback?.enabled) {
       this.browserFallbackClient = new BrowserFallbackClient(this.opts.logger, opts.browserFallback);
-      this.opts.logger.info("Browser fallback enabled");
+
     }
   }
 
@@ -102,20 +108,20 @@ export class HttpClient {
       "User-Agent": this.userAgent,
       "X-Requested-With": "XMLHttpRequest",
     };
-    
+
     // Add Referer header for subsequent requests
     if (this.lastUrl) {
-      h["Referer"] = "https://www.uscardforum.com/";
+      h["Referer"] = this.base.toString();
     }
-    
+
     // Add cookies if we have any
     if (this.cookies.size > 0) {
       h["Cookie"] = Array.from(this.cookies.entries())
         .map(([key, value]) => `${key}=${value}`)
         .join("; ");
-      this.opts.logger.debug(`Using ${this.cookies.size} cookies in request`);
+
     }
-    
+
     if (this.opts.auth.type === "api_key") {
       h["Api-Key"] = this.opts.auth.key;
       if (this.opts.auth.username) h["Api-Username"] = this.opts.auth.username;
@@ -136,7 +142,7 @@ export class HttpClient {
       if (name && valueParts.length > 0) {
         const value = valueParts.join("=");
         this.cookies.set(name.trim(), value.trim());
-        this.opts.logger.debug(`Stored cookie: ${name.trim()}`);
+
       }
     }
   }
@@ -146,7 +152,9 @@ export class HttpClient {
   }
 
   async getCached(path: string, ttlMs: number, { signal }: { signal?: AbortSignal } = {}) {
-    const url = new URL(path, this.base).toString();
+    if (this.disposed) throw new Error("HTTP client has been disposed");
+    throwIfAborted(signal);
+    const url = resolveSiteUrl(this.base.toString(), path);
     const entry = this.cache.get(url);
     const now = Date.now();
     if (entry && entry.expiresAt > now) return entry.value;
@@ -160,126 +168,152 @@ export class HttpClient {
   }
 
   private async request(method: string, path: string, body?: unknown, { signal }: { signal?: AbortSignal } = {}) {
-    const url = new URL(path, this.base).toString();
+    if (this.disposed) throw new Error("HTTP client has been disposed");
+    const started = Date.now();
+    const controller = new AbortController();
+    const budget = createRequestBudget(this.opts.timeoutMs, signal, controller);
+    this.activeControllers.add(controller);
+    const fields = { request_id: randomUUID(), site_id: createHash("sha256").update(this.base.origin).digest("hex").slice(0, 12), method, auth_strategy: this.opts.auth.type === "none" ? this.opts.loginCredentials ? "login_credentials" : "anonymous" : this.opts.auth.type };
+    this.opts.logger.event("http.request.started", fields, "debug");
+    const operation = withSiteRequest(this.base.origin, async () => {
+      budget.remainingMs();
+      const queueMs = Date.now() - started;
+      this.activeRequestId = fields.request_id;
+      this.backendAttempts = 0; this.explicitCalls = 0; this.warmupCalls = 0; this.countsKnown = true;
+      const value = await this.requestUnscheduled(method, path, body, budget);
+      budget.remainingMs();
+      this.opts.logger.event("http.request.completed", { ...fields, queue_ms: queueMs, duration_ms: Date.now() - started, backend_attempts: this.backendAttempts, explicit_request_count_known: this.countsKnown, ...(this.countsKnown ? { explicit_request_count: this.explicitCalls, warmup_request_count: this.warmupCalls } : {}), request_interval_ms: this.opts.requestIntervalMs ?? 500, outcome: "ok" });
+      return value;
+    }, budget.signal, this.opts.requestIntervalMs ?? 500);
+    this.pendingRequests.add(operation);
+    try { return await operation; }
+    catch (error) {
+      const e = error as any;
+      this.opts.logger.event(e instanceof RateLimitError ? "http.rate_limited" : "http.request.failed", { ...fields, duration_ms: Date.now() - started, status: e instanceof HttpError ? e.status : undefined, retry_after_ms: e instanceof RateLimitError ? e.retryAfterMs : undefined, explicit_request_count_known: this.activeRequestId === fields.request_id && this.countsKnown, ...(this.activeRequestId === fields.request_id && this.countsKnown ? { explicit_request_count: this.explicitCalls, warmup_request_count: this.warmupCalls } : {}), outcome: e instanceof RateLimitError ? "rate_limited" : budget.signal.aborted ? "cancelled" : "error" }, e instanceof RateLimitError ? "info" : "error");
+      throw budget.signal.aborted ? cancellationError(budget.signal) : error;
+    } finally {
+      budget.close();
+      this.activeControllers.delete(controller);
+      this.pendingRequests.delete(operation);
+      if (this.activeRequestId === fields.request_id) this.activeRequestId = undefined;
+    }
+  }
+
+  private recordPythonMetrics(result: { explicit_request_count?: number; warmup_request_count?: number }) {
+    if (Number.isSafeInteger(result.explicit_request_count) && Number.isSafeInteger(result.warmup_request_count) && result.explicit_request_count! >= 0 && result.warmup_request_count! >= 0 && result.warmup_request_count! <= result.explicit_request_count!) {
+      this.explicitCalls += result.explicit_request_count!; this.warmupCalls += result.warmup_request_count!;
+    } else this.countsKnown = false;
+  }
+
+  private rateLimit(status: number | undefined, headers: Record<string, string> | undefined, body: unknown) {
+    recordRateLimit(this.base.origin, status, headers, body);
+  }
+
+  private async requestUnscheduled(method: string, path: string, body: unknown, budget: RequestBudget) {
+    const url = resolveSiteUrl(this.base.toString(), path);
     const headers = this.headers();
     if (body !== undefined) {
       headers["Content-Type"] = "application/json";
     }
 
-    this.opts.logger.debug(`HTTP ${method} ${url}`);
-    
-    // Log request headers for debugging
-    this.opts.logger.debug(`Request headers: ${JSON.stringify(headers, null, 2)}`);
-    
-    // Log request body if present
-    if (body !== undefined) {
-      this.opts.logger.debug(`Request body: ${JSON.stringify(body, null, 2)}`);
-    }
-
     // Use bypass method if configured; if bypass runtime is unavailable, gracefully fall back to native fetch
     if (this.cloudscraperClient || this.curlCffiClient) {
       try {
-        return await this.requestViaBypass(method, url, headers, body);
+        return await this.requestViaBypass(method, url, headers, body, budget);
       } catch (e: any) {
-        if (e instanceof BrowserFallbackRelayUnavailableError) {
+        throwIfAborted(budget?.signal);
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") throw e;
+        if (e instanceof BrowserFallbackRelayUnavailableError || e instanceof BrowserSiteBoundaryError) {
           throw e;
         }
         if (e instanceof HttpError) {
           throw e;
         }
-        this.opts.logger.info(`Bypass path failed, falling back to native fetch: ${e?.message || String(e)}`);
+
       }
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.opts.timeoutMs);
-    const combinedSignal = mergeSignals([signal, controller.signal]);
+    budget.remainingMs();
 
     const attempt = async () => {
       try {
+        budget.remainingMs();
+        const backendStarted = Date.now();
+        this.backendAttempts++;
+        this.opts.logger.event("http.backend.started", { request_id: this.activeRequestId, backend: "native", method }, "debug");
+        this.explicitCalls++;
         const res = await fetch(url, {
           method,
           headers,
           body: body !== undefined ? JSON.stringify(body) : undefined,
-          signal: combinedSignal,
+          signal: budget.signal,
         });
 
-        this.opts.logger.debug(`HTTP ${method} ${url} -> ${res.status} ${res.statusText}`);
-        
-        // Log response headers for debugging
+        throwIfAborted(budget?.signal);
+        this.opts.logger.event("http.backend.completed", { request_id: this.activeRequestId, backend: "native", method, status: res.status, duration_ms: Date.now() - backendStarted }, "debug");
+
+        // Headers are retained for classification, never logged.
         const responseHeaders: Record<string, string> = {};
         res.headers.forEach((value, key) => {
           responseHeaders[key] = value;
         });
-        this.opts.logger.debug(`Response headers: ${JSON.stringify(responseHeaders, null, 2)}`);
-        
+
         // Store cookies from response
         const setCookie = res.headers.get("set-cookie");
         if (setCookie) {
           this.parseCookies(setCookie);
-          this.opts.logger.debug(`Received Set-Cookie header: ${setCookie}`);
+
         }
-        
+
         // Update last URL for Referer header
         this.lastUrl = url;
 
         if (!res.ok) {
           const text = await safeText(res);
           const errorBody = safeJson(text);
+          this.rateLimit(res.status, responseHeaders, text);
           const isChallenge = this.isCloudflareChallenge(res.status, text, responseHeaders);
           if (isChallenge && this.browserFallbackClient?.isEnabled()) {
-            this.opts.logger.info(`Cloudflare challenge detected via native fetch (${res.status}), switching to browser fallback`);
-            return await this.tryBrowserFallback(method, url, headers, body);
+
+            return await this.tryBrowserFallback(method, url, headers, body, budget);
           }
-          this.opts.logger.error(`HTTP ${res.status} ${res.statusText} for ${method} ${url}: ${text}`);
+
           throw new HttpError(res.status, `HTTP ${res.status} ${res.statusText}`, errorBody);
         }
         const ct = res.headers.get("content-type") || "";
         if (ct.includes("application/json")) {
-          return res.json();
+          const text = await res.text();
+          budget.remainingMs();
+          this.rateLimit(res.status, responseHeaders, text);
+          try { return JSON.parse(text); } catch { throw new Error("Invalid HTTP response JSON"); }
         } else {
-          return res.text();
+          const text = await res.text();
+          budget.remainingMs();
+          this.rateLimit(res.status, responseHeaders, text);
+          return text;
         }
       } catch (e: any) {
+        throwIfAborted(budget?.signal);
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") throw e;
+        if (e instanceof BrowserFallbackRelayUnavailableError || e instanceof BrowserSiteBoundaryError) throw e;
         // Enhanced error logging for fetch failures
         if (e instanceof HttpError) {
           throw e; // Already logged above
         }
 
         // Check for common fetch failure reasons
-        if (e.name === "AbortError") {
-          const timeoutMsg = `Request timeout after ${this.opts.timeoutMs}ms for ${method} ${url}`;
-          this.opts.logger.error(timeoutMsg);
-          throw new Error(timeoutMsg);
-        }
-
         if (e.name === "TypeError" && e.message === "fetch failed") {
           const detailedMsg = `Network error for ${method} ${url}: ${e.message}. Possible causes: DNS resolution failure, network connectivity issue, SSL/TLS error, or server unreachable.`;
-          this.opts.logger.error(detailedMsg);
-          if (e.cause) {
-            this.opts.logger.error(`Underlying cause: ${String(e.cause)}`);
-          }
           throw new Error(detailedMsg);
         }
 
         // Generic network error
         const genericMsg = `Fetch error for ${method} ${url}: ${e.name}: ${e.message}`;
-        this.opts.logger.error(genericMsg);
-        if (e.cause) {
-          this.opts.logger.error(`Cause: ${String(e.cause)}`);
-        }
-        if (e.stack) {
-          this.opts.logger.debug(`Stack: ${e.stack}`);
-        }
         throw new Error(`${e.name}: ${e.message}`);
       }
     };
 
-    try {
-      return await withRetries(attempt, this.opts.logger, url, method);
-    } finally {
-      clearTimeout(timeout);
-    }
+    return await withRetries(attempt, budget.signal);
   }
 
   private isCloudflareChallenge(status: number | undefined, bodyText: string | undefined, headers: Record<string, string> | undefined): boolean {
@@ -288,11 +322,7 @@ export class HttpClient {
       for (const [k, v] of Object.entries(headers)) normalizedHeaders[k.toLowerCase()] = String(v);
     }
 
-    const cfHeaderHit = Boolean(
-      normalizedHeaders["cf-ray"] ||
-      normalizedHeaders["cf-mitigated"] ||
-      normalizedHeaders["server"]?.toLowerCase().includes("cloudflare")
-    );
+    const cfHeaderHit = normalizedHeaders["cf-mitigated"]?.toLowerCase() === "challenge";
 
     const body = (bodyText || "").toLowerCase();
     const bodyHit =
@@ -316,34 +346,45 @@ export class HttpClient {
     );
   }
 
-  private async tryBrowserFallback(method: string, url: string, headers: Record<string, string>, body?: unknown): Promise<any> {
+  private async tryBrowserFallback(method: string, url: string, headers: Record<string, string>, body?: unknown, budget?: RequestBudget): Promise<any> {
     if (!this.browserFallbackClient?.isEnabled()) {
       return undefined;
     }
 
     const browserRequest = {
       url,
+      siteBase: normalizeSiteBase(this.base.toString()),
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     };
 
-    this.opts.logger.info(`Attempting browser fallback for ${method} ${url}`);
-    let response = await this.browserFallbackClient.request(browserRequest);
-
-      if (this.isLoginRequired(response.finalUrl, response.body)) {
-        if (!this.opts.loginCredentials) {
+    const requestBrowser = async () => {
+      throwIfAborted(budget?.signal);
+      assertNotCoolingDown(this.base.origin);
+      const started = Date.now();
+      this.backendAttempts++; this.countsKnown = false;
+      this.opts.logger.event("http.backend.started", { request_id: this.activeRequestId, backend: "browser", method }, "debug");
+      const response = await this.browserFallbackClient!.request(browserRequest, { signal: budget?.signal, timeoutMs: budget?.remainingMs() });
+      throwIfAborted(budget?.signal);
+      this.opts.logger.event("http.backend.completed", { request_id: this.activeRequestId, backend: "browser", method, status: response.status, duration_ms: Date.now() - started }, "debug");
+      this.rateLimit(response.status, response.headers, response.body);
+      return response;
+    };
+    let response = await requestBrowser();
+    if (this.isLoginRequired(response.finalUrl, response.body)) {
+      if (!this.opts.loginCredentials) {
         throw new Error("Authentication required. Configure an API key or provide NITAN_USERNAME/NITAN_PASSWORD.");
-        }
-
-      const autoLoginAttempted = await this.browserFallbackClient.maybeAutoLogin(this.base.toString());
-      if (autoLoginAttempted) {
-        this.opts.logger.info(`Retrying browser fallback once after auto-login for ${method} ${url}`);
-        response = await this.browserFallbackClient.request(browserRequest);
       }
-
+      throwIfAborted(budget?.signal);
+      assertNotCoolingDown(this.base.origin);
+      const autoLoginAttempted = await this.browserFallbackClient.maybeAutoLogin(this.base.toString(), { signal: budget?.signal, timeoutMs: budget?.remainingMs() }, this.opts.loginCredentials);
+      throwIfAborted(budget?.signal);
+      if (autoLoginAttempted) response = await requestBrowser();
       if (this.isLoginRequired(response.finalUrl, response.body)) {
-        await this.browserFallbackClient.maybePromptInteractiveLogin(this.base.toString());
+        throwIfAborted(budget?.signal);
+        assertNotCoolingDown(this.base.origin);
+        await this.browserFallbackClient.maybePromptInteractiveLogin(this.base.toString(), { signal: budget?.signal, timeoutMs: budget?.remainingMs() });
       }
     }
 
@@ -360,7 +401,7 @@ export class HttpClient {
     return typeof maybeJson === "string" ? response.body : maybeJson;
   }
 
-  private async requestViaBypass(method: string, url: string, headers: Record<string, string>, body?: unknown): Promise<any> {
+  private async requestViaBypass(method: string, url: string, headers: Record<string, string>, body?: unknown, budget?: RequestBudget): Promise<any> {
     // Convert cookies Map to object
     const cookiesObj: Record<string, string> = {};
     this.cookies.forEach((value, key) => {
@@ -368,43 +409,50 @@ export class HttpClient {
     });
 
     // Log cookies being sent
-    this.opts.logger.debug(`Sending ${Object.keys(cookiesObj).length} cookies to bypass: ${Object.keys(cookiesObj).join(", ")}`);
 
     const requestData: any = {
       url,
+      site_base: normalizeSiteBase(this.base.toString()),
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
       cookies: cookiesObj,
-      timeout: Math.floor(this.opts.timeoutMs / 1000), // Convert to seconds
+      timeout: Math.max(0.001, (budget?.remainingMs() ?? this.opts.timeoutMs) / 1000), // Convert to seconds
     };
 
     // Add login credentials if provided
     if (this.opts.loginCredentials) {
       requestData.login = this.opts.loginCredentials;
-      this.opts.logger.debug(`Including login credentials for ${this.opts.loginCredentials.username}`);
+
     }
 
     // Strategy: Try cloudscraper first (if available), fallback to curl_cffi
     let lastError: Error | null = null;
-    
+
     // Try cloudscraper if available and not previously failed (or if it's the only option)
     if (this.cloudscraperClient && (this.bypassMethod === "cloudscraper" || !this.cloudscraperFailed)) {
       try {
-        this.opts.logger.debug(`Using cloudscraper for ${method} ${url}`);
-        const result = await this.cloudscraperClient.request(requestData);
 
+        const backendStarted = Date.now();
+        this.backendAttempts++;
+        this.opts.logger.event("http.backend.started", { request_id: this.activeRequestId, backend: "cloudscraper", method }, "debug");
+        const previouslyKnown = this.countsKnown; this.countsKnown = false;
+        const result = await this.cloudscraperClient.request({ ...requestData, timeout: Math.max(0.001, (budget?.remainingMs() ?? this.opts.timeoutMs) / 1000) }, { signal: budget?.signal });
+        this.countsKnown = previouslyKnown;
+        this.recordPythonMetrics(result);
+        throwIfAborted(budget?.signal);
+        this.opts.logger.event("http.backend.completed", { request_id: this.activeRequestId, backend: "cloudscraper", method, status: result.status, duration_ms: Date.now() - backendStarted }, "debug");
+
+        this.rateLimit(result.status, result.headers, result.body);
         if (!result.success) {
           throw new Error(`Cloudscraper error: ${result.error} (${result.error_type})`);
         }
-
-        this.opts.logger.debug(`Cloudscraper ${method} ${url} -> ${result.status}`);
 
         // Store cookies from response
         if (result.cookies) {
           Object.entries(result.cookies).forEach(([key, value]) => {
             this.cookies.set(key, value);
-            this.opts.logger.debug(`Stored cookie from cloudscraper: ${key}`);
+
           });
         }
 
@@ -415,18 +463,18 @@ export class HttpClient {
         if (result.status && result.status >= 400) {
           const isChallenge = this.isCloudflareChallenge(result.status, result.body, result.headers);
           if (isChallenge && this.browserFallbackClient?.isEnabled()) {
-            this.opts.logger.info(`Cloudflare challenge detected via cloudscraper (${result.status}), switching to browser fallback`);
-            return await this.tryBrowserFallback(method, url, headers, body);
+
+            return await this.tryBrowserFallback(method, url, headers, body, budget);
           }
 
           const errorBody = safeJson(result.body || "");
-          this.opts.logger.error(`HTTP ${result.status} for ${method} ${url}: ${result.body}`);
+
           throw new HttpError(result.status, `HTTP ${result.status}`, errorBody);
         }
 
         if (this.isCloudflareChallenge(result.status, result.body, result.headers) && this.browserFallbackClient?.isEnabled()) {
-          this.opts.logger.info(`Cloudflare challenge page detected via cloudscraper (${result.status}), switching to browser fallback`);
-          return await this.tryBrowserFallback(method, url, headers, body);
+
+          return await this.tryBrowserFallback(method, url, headers, body, budget);
         }
 
         // Parse response body
@@ -437,51 +485,59 @@ export class HttpClient {
           return result.body;
         }
       } catch (e: any) {
-        if (e instanceof BrowserFallbackRelayUnavailableError) {
+        throwIfAborted(budget?.signal);
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") throw e;
+        if (e instanceof BrowserFallbackRelayUnavailableError || e instanceof BrowserSiteBoundaryError) {
           throw e;
         }
         if (e instanceof HttpError) {
           throw e; // Don't fallback on HTTP errors (4xx, 5xx)
         }
-        
+
         lastError = e;
-        this.opts.logger.info(`Cloudscraper failed: ${e.message}`);
-        
+
         // Mark cloudscraper as failed if we're in dual mode
         if (this.bypassMethod === "both") {
           this.cloudscraperFailed = true;
-          this.opts.logger.info("Marking cloudscraper as failed, will use curl_cffi for future requests");
+
         }
-        
+
         // If we're in cloudscraper-only mode, throw the error
         if (this.bypassMethod === "cloudscraper") {
           const errorMsg = `Cloudscraper request failed: ${e.message}`;
-          this.opts.logger.error(errorMsg);
+
           throw new Error(errorMsg);
         }
-        
+
         // Otherwise fall through to try curl_cffi
-        this.opts.logger.info("Falling back to curl_cffi...");
+
       }
     }
-    
+
     // Try curl_cffi if available
     if (this.curlCffiClient) {
       try {
-        this.opts.logger.debug(`Using curl_cffi for ${method} ${url}`);
-        const result = await this.curlCffiClient.request(requestData);
 
+        const backendStarted = Date.now();
+        this.backendAttempts++;
+        this.opts.logger.event("http.backend.started", { request_id: this.activeRequestId, backend: "curl_cffi", method }, "debug");
+        const previouslyKnown = this.countsKnown; this.countsKnown = false;
+        const result = await this.curlCffiClient.request({ ...requestData, timeout: Math.max(0.001, (budget?.remainingMs() ?? this.opts.timeoutMs) / 1000) }, { signal: budget?.signal });
+        this.countsKnown = previouslyKnown;
+        this.recordPythonMetrics(result);
+        throwIfAborted(budget?.signal);
+        this.opts.logger.event("http.backend.completed", { request_id: this.activeRequestId, backend: "curl_cffi", method, status: result.status, duration_ms: Date.now() - backendStarted }, "debug");
+
+        this.rateLimit(result.status, result.headers, result.body);
         if (!result.success) {
           throw new Error(`curl_cffi error: ${result.error} (${result.error_type})`);
         }
-
-        this.opts.logger.debug(`curl_cffi ${method} ${url} -> ${result.status}`);
 
         // Store cookies from response
         if (result.cookies) {
           Object.entries(result.cookies).forEach(([key, value]) => {
             this.cookies.set(key, value);
-            this.opts.logger.debug(`Stored cookie from curl_cffi: ${key}`);
+
           });
         }
 
@@ -492,18 +548,18 @@ export class HttpClient {
         if (result.status && result.status >= 400) {
           const isChallenge = this.isCloudflareChallenge(result.status, result.body, result.headers);
           if (isChallenge && this.browserFallbackClient?.isEnabled()) {
-            this.opts.logger.info(`Cloudflare challenge detected via curl_cffi (${result.status}), switching to browser fallback`);
-            return await this.tryBrowserFallback(method, url, headers, body);
+
+            return await this.tryBrowserFallback(method, url, headers, body, budget);
           }
 
           const errorBody = safeJson(result.body || "");
-          this.opts.logger.error(`HTTP ${result.status} for ${method} ${url}: ${result.body}`);
+
           throw new HttpError(result.status, `HTTP ${result.status}`, errorBody);
         }
 
         if (this.isCloudflareChallenge(result.status, result.body, result.headers) && this.browserFallbackClient?.isEnabled()) {
-          this.opts.logger.info(`Cloudflare challenge page detected via curl_cffi (${result.status}), switching to browser fallback`);
-          return await this.tryBrowserFallback(method, url, headers, body);
+
+          return await this.tryBrowserFallback(method, url, headers, body, budget);
         }
 
         // Parse response body
@@ -514,76 +570,62 @@ export class HttpClient {
           return result.body;
         }
       } catch (e: any) {
-        if (e instanceof BrowserFallbackRelayUnavailableError) {
+        throwIfAborted(budget?.signal);
+        if (e?.name === "AbortError" || e?.name === "TimeoutError") throw e;
+        if (e instanceof BrowserFallbackRelayUnavailableError || e instanceof BrowserSiteBoundaryError) {
           throw e;
         }
         if (e instanceof HttpError) {
           throw e; // Don't retry on HTTP errors
         }
-        
+
         const errorMsg = `curl_cffi request failed: ${e.message}`;
-        this.opts.logger.error(errorMsg);
-        
+
         // If we had a previous cloudscraper error, mention both
         if (lastError) {
-          this.opts.logger.error(`Both bypass methods failed. Cloudscraper: ${lastError.message}, curl_cffi: ${e.message}`);
+
           throw new Error(`Both bypass methods failed. Last error: ${e.message}`);
         }
-        
+
         throw new Error(errorMsg);
       }
     }
-    
+
     // This should never happen if configuration is correct
     throw new Error("No bypass method available");
   }
 
   async dispose(): Promise<void> {
-    if (!this.browserFallbackClient) return;
-    try {
-      await this.browserFallbackClient.dispose();
-    } catch (e: any) {
-      this.opts.logger.debug(`Failed to dispose browser fallback client cleanly: ${e?.message || String(e)}`);
-    }
+    this.disposed = true;
+    for (const controller of this.activeControllers) controller.abort(new DOMException("Request cancelled", "AbortError"));
+    const browserCleanup = Promise.resolve().then(() => this.browserFallbackClient?.dispose())
+      .catch(() => this.opts.logger.event("http.backend.failed", { backend: "browser", outcome: "error", reason: "transport_unavailable" }, "error"));
+    await Promise.allSettled([...this.pendingRequests, browserCleanup]);
   }
 }
 
-async function withRetries<T>(fn: () => Promise<T>, logger: Logger, url: string, method: string, retries = 3): Promise<T> {
+async function withRetries<T>(fn: () => Promise<T>, signal: AbortSignal, retries = 3): Promise<T> {
   let attempt = 0;
-  let delay = 250;
+  let retryDelay = 250;
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
+      throwIfAborted(signal);
       return await fn();
     } catch (e: any) {
+      if (e instanceof RateLimitError) throw e;
       const status = e?.status as number | undefined;
-      if (attempt < retries - 1 && (status === 429 || (status && status >= 500))) {
+      if (attempt < retries - 1 && (status && status >= 500)) {
         attempt++;
-        logger.info(`Retrying ${method} ${url} (attempt ${attempt}/${retries - 1}) after ${delay}ms due to ${status || 'error'}`);
-        await new Promise((r) => setTimeout(r, delay));
-        delay *= 2;
+
+        await retrySleep(retryDelay, signal);
+        retryDelay *= 2;
         continue;
       }
-      // Log final failure
-      if (attempt > 0) {
-        logger.error(`Request failed after ${attempt + 1} attempts: ${method} ${url}`);
-      }
+      // Propagate final failure; the request wrapper emits its operational event.
       throw e;
     }
   }
-}
-
-function mergeSignals(signals: Array<AbortSignal | undefined>): AbortSignal {
-  const controller = new AbortController();
-  for (const s of signals) {
-    if (!s) continue;
-    if (s.aborted) {
-      controller.abort();
-      break;
-    }
-    s.addEventListener("abort", () => controller.abort(), { once: true });
-  }
-  return controller.signal;
 }
 
 async function safeText(res: Response): Promise<string> {

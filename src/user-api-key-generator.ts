@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { normalizeSiteBase, resolveSiteUrl, sameSite } from "./util/site_url.js";
 import { generateKeyPairSync, privateDecrypt, constants, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
@@ -148,7 +149,7 @@ export async function openAuthorizationUrl(url: string, platform = process.platf
 }
 
 export function buildAuthorizationUrl(options: GenerateOptions, publicKey: string): string {
-  const url = new URL(`${options.site}/user-api-key/new`);
+  const url = new URL(resolveSiteUrl(options.site, "/user-api-key/new"));
 
   const params = new URLSearchParams({
     application_name: options.applicationName || "Discourse MCP",
@@ -173,7 +174,7 @@ export function createPendingUserApiKeyState(options: GenerateOptions): PendingU
   return {
     version: 1,
     createdAt: new Date().toISOString(),
-    site: options.site,
+    site: normalizeSiteBase(options.site),
     scopes: options.scopes || "read",
     applicationName: options.applicationName || "Discourse MCP",
     clientId,
@@ -186,7 +187,7 @@ export function createPendingUserApiKeyState(options: GenerateOptions): PendingU
 export function prepareUserApiKeyGeneration(options: GenerateOptions): PreparedUserApiKeyGeneration {
   const state = createPendingUserApiKeyState(options);
   const authUrl = buildAuthorizationUrl({
-    site: state.site,
+    site: normalizeSiteBase(state.site),
     scopes: state.scopes,
     applicationName: state.applicationName,
     clientId: state.clientId,
@@ -223,14 +224,14 @@ export function extractUserApiKeyFromPayload(state: PendingUserApiKeyState, payl
   const decrypted = decryptPayload(payload, state.privateKey);
   const result = JSON.parse(decrypted);
 
-  if (!result.key) {
+  if (typeof result?.key !== "string" || !result.key) {
     throw new Error("Invalid response: missing 'key' field");
   }
 
   return {
     key: result.key,
     clientId: state.clientId,
-    site: state.site,
+    site: normalizeSiteBase(state.site),
   };
 }
 
@@ -297,12 +298,12 @@ export async function saveToProfile(
     profile.auth_pairs = [];
   }
 
-  // Remove any existing entry for this site
-  profile.auth_pairs = profile.auth_pairs.filter((p: any) => p.site !== site);
-
-  // Add new entry
+  const base = normalizeSiteBase(site);
+  const previous = Object.assign({}, ...profile.auth_pairs.filter((pair: any) => sameSite(pair?.site, base)));
+  profile.auth_pairs = profile.auth_pairs.filter((pair: any) => !sameSite(pair?.site, base));
   profile.auth_pairs.push({
-    site,
+    ...previous,
+    site: base,
     user_api_key: userApiKey,
     user_api_client_id: clientId,
   });

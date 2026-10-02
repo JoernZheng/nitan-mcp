@@ -1,4 +1,17 @@
-Changelog
+# Changelog
+
+## Unreleased — maintained personal fork
+
+- Node 22 and SDK 1.30.0; preserve nine read-only tools.
+- Reliable sparse/deleted-floor continuation, honest timestamps and partial
+  results, compact bounded output and source references.
+- Shared request pacing/cooldown, cancellation and safe metrics; exact forum/auth
+  boundaries and loopback HTTP lifecycle fixes.
+- Persistent resumable collection, topic previews and local directories/chunks.
+- Simplified fork installation and documentation; no upstream npm publication.
+
+## Earlier upstream history
+
 ### [0.1.9](https://github.com/discourse/discourse-mcp/compare/v0.1.8...v0.1.9) (2025-10-20)
 
 #### Features

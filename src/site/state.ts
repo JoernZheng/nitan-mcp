@@ -1,9 +1,10 @@
+import { normalizeSiteBase, sameSite } from "../util/site_url.js";
 import type { Logger } from "../util/logger.js";
 import { HttpClient, type AuthMode, type BypassMethod } from "../http/client.js";
 import type { BrowserFallbackOptions } from "../http/browser_fallback.js";
 
 export type AuthOverride = {
-  site: string; // base URL or origin to match
+  site: string; // exact normalized forum base, including its subdirectory
   api_key?: string;
   api_username?: string;
   user_api_key?: string;
@@ -13,23 +14,31 @@ export type AuthOverride = {
   second_factor_token?: string; // 2FA token (used with cloudscraper)
 };
 
-function normalizeBase(url: string): string {
-  const u = new URL(url);
-  u.pathname = "/";
-  u.search = "";
-  u.hash = "";
-  return u.toString().replace(/\/$/, "");
+/** Merge URL variants once, preserving API and login fields; later fields win. */
+export function normalizeAuthOverrides(overrides: AuthOverride[]): AuthOverride[] {
+  const merged: AuthOverride[] = [];
+  for (const override of overrides) {
+    const index = merged.findIndex(existing => sameSite(existing.site, override.site));
+    const item = { ...override, site: sameSite(override.site, override.site) ? normalizeSiteBase(override.site) : override.site };
+    if (index < 0) merged.push(item);
+    else merged[index] = { ...merged[index], ...item };
+  }
+  return merged;
 }
 
 export class SiteState {
   private currentSiteBase?: string;
   private currentClient?: HttpClient;
   private readonly clientCache = new Map<string, HttpClient>();
+  private readonly retiringClients = new Set<Promise<void>>();
+  private disposed = false;
+  private closing?: Promise<void>;
 
   constructor(
     private opts: {
       logger: Logger;
       timeoutMs: number;
+      requestIntervalMs?: number;
       defaultAuth: AuthMode;
       authOverrides?: AuthOverride[];
       bypassMethod?: BypassMethod;
@@ -37,13 +46,31 @@ export class SiteState {
       pythonPath?: string;
       browserFallback?: BrowserFallbackOptions;
     }
-  ) {}
+  ) {
+    this.opts.authOverrides = normalizeAuthOverrides(opts.authOverrides ?? []);
+  }
+
+  private ensureActive(): void {
+    if (this.disposed) throw new Error("Site state has been disposed");
+  }
+
+  private invalidateClient(base: string): void {
+    const client = this.clientCache.get(base);
+    this.clientCache.delete(base);
+    if (this.currentSiteBase === base) { this.currentSiteBase = undefined; this.currentClient = undefined; }
+    if (client) {
+      const retiring = client.dispose().catch(() => this.opts.logger.error("Retired site client cleanup failed"))
+        .finally(() => this.retiringClients.delete(retiring));
+      this.retiringClients.add(retiring);
+    }
+  }
 
   getSiteBase(): string | undefined {
     return this.currentSiteBase;
   }
 
   ensureSelectedSite(): { base: string; client: HttpClient } {
+    this.ensureActive();
     if (!this.currentSiteBase || !this.currentClient) {
       throw new Error("No site selected. Call discourse_select_site first.");
     }
@@ -51,7 +78,8 @@ export class SiteState {
   }
 
   buildClientForSite(siteUrl: string): { base: string; client: HttpClient } {
-    const base = normalizeBase(siteUrl);
+    this.ensureActive();
+    const base = normalizeSiteBase(siteUrl);
     const cached = this.clientCache.get(base);
     if (cached) return { base, client: cached };
 
@@ -68,6 +96,7 @@ export class SiteState {
     const client = new HttpClient({
       baseUrl: base,
       timeoutMs: this.opts.timeoutMs,
+      requestIntervalMs: this.opts.requestIntervalMs,
       logger: this.opts.logger,
       auth,
       bypassMethod,
@@ -87,12 +116,12 @@ export class SiteState {
   }
 
   hasAuthForSite(siteUrl: string): boolean {
-    const base = normalizeBase(siteUrl);
+    const base = normalizeSiteBase(siteUrl);
     return this.resolveAuthForSite(base).type !== "none";
   }
 
   hasLoginForSite(siteUrl: string): boolean {
-    const base = normalizeBase(siteUrl);
+    const base = normalizeSiteBase(siteUrl);
     return Boolean(this.resolveLoginForSite(base));
   }
 
@@ -100,57 +129,36 @@ export class SiteState {
     return this.hasAuthForSite(siteUrl) || this.hasLoginForSite(siteUrl);
   }
 
-  // 热更新 auth — 替换或追加指定 site 的认证信息，并清除缓存的 client
+  // Update only this exact forum; preserve its configured login rescue fields.
   updateAuthOverride(override: AuthOverride): void {
-    if (!this.opts.authOverrides) this.opts.authOverrides = [];
-    const base = normalizeBase(override.site);
-    const idx = this.opts.authOverrides.findIndex(
-      (o) => normalizeBase(o.site) === base || this.sameOrigin(o.site, base)
-    );
-    if (idx >= 0) {
-      this.opts.authOverrides[idx] = override;
-    } else {
-      this.opts.authOverrides.push(override);
-    }
-    // 清除该 site 的缓存 client，下次 buildClientForSite 会用新 auth 重建
-    const cached = this.clientCache.get(base);
-    if (cached) {
-      cached.dispose().catch(() => {});
-      this.clientCache.delete(base);
-    }
-    // 如果当前选中的就是这个 site，也清掉让它重建
-    if (this.currentSiteBase === base) {
-      this.currentSiteBase = undefined;
-      this.currentClient = undefined;
-    }
+    this.ensureActive();
+    const base = normalizeSiteBase(override.site);
+    const overrides = this.opts.authOverrides!;
+    const index = overrides.findIndex(existing => sameSite(existing.site, base));
+    if (index < 0) overrides.push({ ...override, site: base });
+    else overrides[index] = { ...overrides[index], ...override, site: base };
+    this.invalidateClient(base);
   }
 
-  // 移除指定 site 的认证信息并清除缓存
   removeAuthOverride(siteUrl: string): void {
-    if (!this.opts.authOverrides) return;
-    const base = normalizeBase(siteUrl);
-    this.opts.authOverrides = this.opts.authOverrides.filter(
-      (o) => normalizeBase(o.site) !== base && !this.sameOrigin(o.site, base)
-    );
-    const cached = this.clientCache.get(base);
-    if (cached) {
-      cached.dispose().catch(() => {});
-      this.clientCache.delete(base);
-    }
-    if (this.currentSiteBase === base) {
-      this.currentSiteBase = undefined;
-      this.currentClient = undefined;
-    }
+    this.ensureActive();
+    const base = normalizeSiteBase(siteUrl);
+    this.opts.authOverrides = this.opts.authOverrides!.filter(override => !sameSite(override.site, base));
+    this.invalidateClient(base);
   }
 
-  async dispose(): Promise<void> {
-    const clients = Array.from(new Set(this.clientCache.values()));
-    await Promise.allSettled(clients.map((client) => client.dispose()));
+  dispose(): Promise<void> {
+    if (this.closing) return this.closing;
+    this.disposed = true;
+    const clients = [...new Set(this.clientCache.values())];
+    this.clientCache.clear(); this.currentSiteBase = undefined; this.currentClient = undefined;
+    this.closing = Promise.allSettled([...clients.map(client => client.dispose()), ...this.retiringClients]).then(() => undefined);
+    return this.closing;
   }
 
   private resolveAuthForSite(base: string): AuthMode {
     const overrides = this.opts.authOverrides || [];
-    const match = overrides.find((o) => normalizeBase(o.site) === base || this.sameOrigin(o.site, base));
+    const match = overrides.find((o) => sameSite(o.site, base));
     if (match) {
       // Prefer user_api_key if provided
       if (match.user_api_key) return { type: "user_api_key", key: match.user_api_key, client_id: match.user_api_client_id };
@@ -161,7 +169,7 @@ export class SiteState {
 
   private resolveLoginForSite(base: string): { username: string; password: string; second_factor_token?: string } | undefined {
     const overrides = this.opts.authOverrides || [];
-    const match = overrides.find((o) => normalizeBase(o.site) === base || this.sameOrigin(o.site, base));
+    const match = overrides.find((o) => sameSite(o.site, base));
     if (match?.username && match?.password) {
       return {
         username: match.username,
@@ -172,15 +180,7 @@ export class SiteState {
     return undefined;
   }
 
-  private sameOrigin(a: string, b: string): boolean {
-    try {
-      const ua = new URL(a);
-      const ub = new URL(b);
-      return ua.protocol === ub.protocol && ua.host === ub.host;
-    } catch {
-      return false;
-    }
-  }
+
 }
 
 export type SiteStateInit = ConstructorParameters<typeof SiteState>[0];

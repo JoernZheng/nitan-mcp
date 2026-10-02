@@ -18,6 +18,7 @@ python3 - "$TOOL_NAME" "$ARGS_JSON" "$MCP_PACKAGE" "$MCP_ALLOW_INSTALL" <<'PY'
 import json
 import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -85,6 +86,7 @@ proc = subprocess.Popen(
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=sys.stderr,
+    start_new_session=True,
 )
 
 try:
@@ -117,15 +119,34 @@ try:
         print(json.dumps(call_res["error"], ensure_ascii=False, indent=2), file=sys.stderr)
         sys.exit(4)
 
-    print(json.dumps(call_res.get("result", {}), ensure_ascii=False, indent=2))
+    result = call_res.get("result", {})
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("isError"):
+        sys.exit(5)
 except (TimeoutError, EOFError) as exc:
     print(f"Failed to communicate with local MCP server: {exc}", file=sys.stderr)
     if proc.poll() not in (None, 0):
         print(f"Failed MCP package: {mcp_package}", file=sys.stderr)
     sys.exit(6)
 finally:
+    # Let the server observe EOF and finish owned backend cleanup first.
     try:
-        proc.terminate()
+        proc.stdin.close()
     except Exception:
         pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
 PY

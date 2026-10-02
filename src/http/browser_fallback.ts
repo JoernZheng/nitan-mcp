@@ -1,4 +1,9 @@
-import { execFile, spawn } from "node:child_process";
+import { normalizeSiteBase, isUrlWithinSite } from "../util/site_url.js";
+import { RateLimitError } from "./errors.js";
+import { isRateLimited, recordRateLimit, assertNotCoolingDown } from "./rate_limit.js";
+import { execFile } from "node:child_process";
+import { createRequestBudget, cancellationError, type RequestBudget } from "./request_budget.js";
+import { delay } from "./rate_limit.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -21,6 +26,10 @@ export interface BrowserFallbackOptions {
   playwrightModuleLoader?: () => Promise<any>;
 }
 
+export class BrowserSiteBoundaryError extends Error {
+  constructor(message = "Browser navigated outside the configured site; check the login URL before retrying") { super(message); this.name = "BrowserSiteBoundaryError"; }
+}
+
 export class BrowserFallbackRelayUnavailableError extends Error {
   constructor(message: string) {
     super(message);
@@ -28,8 +37,16 @@ export class BrowserFallbackRelayUnavailableError extends Error {
   }
 }
 
+export interface BrowserLoginCredentials { username: string; password: string; }
+
+export interface BrowserOperationOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
 export interface BrowserRequest {
   url: string;
+  siteBase?: string;
   method: string;
   headers?: Record<string, string>;
   body?: string;
@@ -184,6 +201,10 @@ export class BrowserFallbackClient {
   private readonly playwrightModuleLoader: () => Promise<any>;
   private playwrightSession?: PlaywrightSession;
   private creatingPlaywrightSession?: Promise<PlaywrightSession>;
+  private sessionGeneration = 0;
+  private disposed = false;
+  private readonly controllers = new Set<AbortController>();
+  private readonly operations = new Set<Promise<unknown>>();
 
   constructor(private readonly logger: Logger, private readonly options: BrowserFallbackOptions = {}) {
     this.timeoutMs = options.timeoutMs ?? 45_000;
@@ -196,49 +217,71 @@ export class BrowserFallbackClient {
   };
 
   async dispose(): Promise<void> {
-    await this.closePlaywrightSession();
+    this.disposed = true;
+    for (const controller of this.controllers) controller.abort();
+    await Promise.allSettled([...this.operations, this.closePlaywrightSession()]);
   }
 
-  private async openChromeOnMac(openArgs: string[], errorPrefix: string): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn("open", openArgs);
-      proc.on("error", reject);
-      proc.on("exit", (code) => {
-        if (code === 0) resolve();
-        else reject(new Error(`${errorPrefix}, exit code: ${code}`));
-      });
+  private async runWithBudget<T>(options: BrowserOperationOptions, operation: (budget: RequestBudget) => Promise<T>): Promise<T> {
+    if (this.disposed) throw new Error("Browser fallback client has been disposed");
+    if (this.controllers.size) throw new Error("Browser fallback already has an active operation; retry after it finishes");
+    const controller = new AbortController();
+    const budget = createRequestBudget(Math.min(options.timeoutMs ?? this.timeoutMs, this.timeoutMs), options.signal, controller);
+    this.controllers.add(controller);
+    let cleanup: Promise<void> | undefined;
+    const abort = () => { cleanup ??= this.closePlaywrightSession(); };
+    budget.signal.addEventListener("abort", abort, { once: true });
+    const pending = (async () => {
+      budget.remainingMs();
+      const result = await operation(budget);
+      budget.remainingMs();
+      return result;
+    })();
+    this.operations.add(pending);
+    try { return await pending; }
+    catch (error) { if (budget.signal.aborted) throw cancellationError(budget.signal); throw error; }
+    finally {
+      budget.signal.removeEventListener("abort", abort);
+      await cleanup;
+      budget.close();
+      this.controllers.delete(controller);
+      this.operations.delete(pending);
+    }
+  }
+
+  /** Resource creation may finish after abort. Own and close that late result. */
+  private waitForResource<T>(promise: Promise<T>, budget: RequestBudget, close: (resource: T) => Promise<unknown>): Promise<T> {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => budget.signal.removeEventListener("abort", abort);
+      const abort = () => { if (!settled) { settled = true; cleanup(); reject(cancellationError(budget.signal)); } };
+      budget.signal.addEventListener("abort", abort, { once: true });
+      if (budget.signal.aborted) abort();
+      promise.then(resource => {
+        if (settled) {
+          void close(resource).catch(() => this.logger.event("http.backend.failed", { backend: "browser", reason: "transport_unavailable", outcome: "error" }, "error"));
+        } else { settled = true; cleanup(); resolve(resource); }
+      }, error => { if (!settled) { settled = true; cleanup(); reject(error); } });
     });
+  }
+
+  private async openChromeOnMac(openArgs: string[], _errorPrefix: string, budget: RequestBudget): Promise<void> {
+    await execFileAsync("open", openArgs, { signal: budget.signal, timeout: budget.remainingMs() });
+    budget.remainingMs();
   }
 
   private escapeAppleScriptString(value: string): string {
     return value.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
   }
 
-  private async runAppleScript(lines: string[]): Promise<string> {
+  private async runAppleScript(lines: string[], budget: RequestBudget): Promise<string> {
     const args = lines.flatMap((line) => ["-e", line]);
-    return await new Promise<string>((resolve, reject) => {
-      const proc = spawn("osascript", args);
-      let stdout = "";
-      let stderr = "";
-      proc.stdout?.on("data", (chunk) => {
-        stdout += String(chunk);
-      });
-      proc.stderr?.on("data", (chunk) => {
-        stderr += String(chunk);
-      });
-      proc.on("error", reject);
-      proc.on("exit", (code) => {
-        if (code === 0) {
-          resolve(stdout.trim());
-          return;
-        }
-        const suffix = stderr.trim() ? `. ${stderr.trim()}` : "";
-        reject(new Error(`AppleScript failed, exit code: ${code}${suffix}`));
-      });
-    });
+    const { stdout } = await execFileAsync("osascript", args, { signal: budget.signal, timeout: budget.remainingMs() });
+    budget.remainingMs();
+    return stdout.trim();
   }
 
-  private async openUrlInFrontChromeTabOnMac(url: string): Promise<void> {
+  private async openUrlInFrontChromeTabOnMac(url: string, budget: RequestBudget): Promise<void> {
     const escapedUrl = this.escapeAppleScriptString(url);
     let lastFrontUrl = "";
 
@@ -249,14 +292,15 @@ export class BrowserFallbackClient {
         `tell application \"Google Chrome\" to set URL of active tab of front window to \"${escapedUrl}\"`,
         "delay 0.25",
         "tell application \"Google Chrome\" to return URL of active tab of front window",
-      ]);
+      ], budget);
+      budget.remainingMs();
 
       lastFrontUrl = frontUrl;
       if (frontUrl === url || frontUrl.startsWith(url)) {
         return;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, 250));
+      await delay(250, budget.signal);
     }
 
     throw new Error(
@@ -289,7 +333,12 @@ export class BrowserFallbackClient {
     return { username, password };
   }
 
-  private async submitLoginForm(page: any, loginUrl: string, username: string, password: string): Promise<void> {
+  private async safeResponseBody(response: any): Promise<string> {
+    try { return typeof response?.text === "function" ? await response.text() : ""; }
+    catch { return ""; }
+  }
+
+  private async submitLoginForm(page: any, loginUrl: string, username: string, password: string, budget: RequestBudget, siteBase: string): Promise<void> {
     const loginInputSelector = [
       'input[name="login"]',
       "#login-account-name",
@@ -309,20 +358,39 @@ export class BrowserFallbackClient {
       '.btn-primary[type="submit"]',
     ];
 
-    await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
-    await page.waitForSelector(loginInputSelector, { timeout: Math.min(this.timeoutMs, 10_000) });
-    await page.waitForSelector(passwordInputSelector, { timeout: Math.min(this.timeoutMs, 10_000) });
+    assertNotCoolingDown(new URL(loginUrl).origin);
+    const navigation = await page.goto(loginUrl, { waitUntil: "domcontentloaded", timeout: budget.remainingMs() });
+    if (navigation) recordRateLimit(new URL(loginUrl).origin, navigation.status(), navigation.headers?.(), await this.safeResponseBody(navigation));
+    budget.remainingMs();
+    this.assertPageWithinSite(page, siteBase);
+    await page.waitForSelector(loginInputSelector, { timeout: Math.min(budget.remainingMs(), 10_000) });
+    budget.remainingMs();
+    await page.waitForSelector(passwordInputSelector, { timeout: Math.min(budget.remainingMs(), 10_000) });
 
+    budget.remainingMs();
+    this.assertPageWithinSite(page, siteBase);
     await page.fill(loginInputSelector, username);
+    budget.remainingMs();
+    this.assertPageWithinSite(page, siteBase);
     await page.fill(passwordInputSelector, password);
 
+    budget.remainingMs();
+    // Observe the login POST before clicking so a 429 cannot be swallowed as
+    // a generic unsuccessful login followed by another target request.
+    const loginResponse = typeof page.waitForResponse === "function"
+      ? page.waitForResponse((response: any) => response.request?.().method?.() === "POST" && /\/session(?:\.json)?$/.test(new URL(response.url()).pathname), { timeout: Math.min(budget.remainingMs(), 10000) }).catch(() => null)
+      : undefined;
     let submitted = false;
     for (const selector of submitSelectors) {
+      budget.remainingMs();
       const button = await page.$(selector);
+      budget.remainingMs();
       if (!button) continue;
 
+      budget.remainingMs();
+      this.assertPageWithinSite(page, siteBase);
       await Promise.allSettled([
-        page.waitForLoadState("domcontentloaded", { timeout: Math.min(this.timeoutMs, 10_000) }),
+        page.waitForLoadState("domcontentloaded", { timeout: Math.min(budget.remainingMs(), 10_000) }),
         page.click(selector),
       ]);
       submitted = true;
@@ -330,36 +398,51 @@ export class BrowserFallbackClient {
     }
 
     if (!submitted) {
+      budget.remainingMs();
+      this.assertPageWithinSite(page, siteBase);
       await page.keyboard.press("Enter");
-      await page.waitForLoadState("domcontentloaded", { timeout: Math.min(this.timeoutMs, 10_000) }).catch(() => undefined);
+      budget.remainingMs();
+      await page.waitForLoadState("domcontentloaded", { timeout: Math.min(budget.remainingMs(), 10_000) }).catch(() => undefined);
     }
 
+    budget.remainingMs();
+    const submittedResponse = await loginResponse;
+    budget.remainingMs();
+    if (submittedResponse) {
+      recordRateLimit(new URL(loginUrl).origin, submittedResponse.status(), submittedResponse.headers?.(), await this.safeResponseBody(submittedResponse));
+    }
+    budget.remainingMs();
     if (typeof page.waitForTimeout === "function") {
       await page.waitForTimeout(500);
     }
   }
 
-  async maybeAutoLogin(siteUrl: string): Promise<boolean> {
+  async maybeAutoLogin(siteUrl: string, options: BrowserOperationOptions = {}, suppliedCredentials?: BrowserLoginCredentials): Promise<boolean> {
     if (process.platform !== "darwin") return false;
     const provider = this.options.provider ?? getDefaultBrowserFallbackProvider();
     if (provider !== "playwright") return false;
 
-    const credentials = this.resolveEnvAutoLoginCredentials();
+    const credentials = suppliedCredentials ?? this.resolveEnvAutoLoginCredentials();
     if (!credentials) return false;
 
-    try {
-      const profileSelection = this.resolvePlaywrightProfileSelection();
-      const session = await this.getOrCreatePlaywrightSession(profileSelection);
-      const page = await this.getOrCreatePlaywrightPage(session);
-      const loginUrl = this.options.loginCheckUrl || siteUrl;
+    return this.runWithBudget(options, async budget => {
+      const siteBase = normalizeSiteBase(siteUrl);
+      const loginUrl = this.options.loginCheckUrl || siteBase;
+      if (!isUrlWithinSite(loginUrl, siteBase)) throw new BrowserSiteBoundaryError("Login URL is outside the configured site");
+      try {
+        const profileSelection = this.resolvePlaywrightProfileSelection();
+        const session = await this.getOrCreatePlaywrightSession(profileSelection, budget);
+        const page = await this.getOrCreatePlaywrightPage(session, budget);
 
-      this.logger.info("Attempting browser auto-login with configured NITAN credentials");
-      await this.submitLoginForm(page, loginUrl, credentials.username, credentials.password);
-      return true;
-    } catch (e: any) {
-      this.logger.info(`Browser auto-login attempt did not complete: ${e?.message || String(e)}`);
-      return true;
-    }
+        await this.submitLoginForm(page, loginUrl, credentials.username, credentials.password, budget, siteBase);
+        return true;
+      } catch (e: any) {
+        budget.remainingMs();
+        if (e instanceof RateLimitError || e instanceof BrowserSiteBoundaryError) throw e;
+
+        return true;
+      }
+    });
   }
 
   private buildPlaywrightSessionKey(profileSelection: BrowserProfileSelection): string {
@@ -397,32 +480,33 @@ export class BrowserFallbackClient {
     );
   }
 
+  private logCleanupFailure(): void {
+    this.logger.event("http.backend.failed", { backend: "browser", reason: "transport_unavailable", outcome: "error" }, "error");
+  }
+
   private async closePlaywrightSession(): Promise<void> {
+    this.sessionGeneration++;
     const session = this.playwrightSession;
+    const pendingSession = this.creatingPlaywrightSession;
     this.playwrightSession = undefined;
+    this.creatingPlaywrightSession = undefined;
 
     if (session) {
       try {
         await session.context.close();
-      } catch (e: any) {
-        this.logger.debug(`Failed to close Playwright context cleanly: ${e?.message || String(e)}`);
-      }
+      } catch { this.logCleanupFailure(); }
     }
 
-    const pendingSession = this.creatingPlaywrightSession;
-    this.creatingPlaywrightSession = undefined;
     if (pendingSession) {
       try {
         const created = await pendingSession;
         if (created && created !== session) {
           try {
             await created.context.close();
-          } catch (closeError: any) {
-            this.logger.debug(`Failed to close pending Playwright context: ${closeError?.message || String(closeError)}`);
-          }
+          } catch { this.logCleanupFailure(); }
         }
       } catch (pendingError: any) {
-        this.logger.debug(`Pending Playwright session did not resolve cleanly: ${pendingError?.message || String(pendingError)}`);
+
       }
     }
   }
@@ -436,90 +520,10 @@ export class BrowserFallbackClient {
     );
   }
 
-  private async listLockedProfileChromePids(profileSelection: BrowserProfileSelection): Promise<number[]> {
-    try {
-      const { stdout } = await execFileAsync("ps", ["-axo", "pid=,command="]); 
-      const userDataArg = `--user-data-dir=${profileSelection.userDataDir}`;
-      const pids = new Set<number>();
-
-      for (const line of stdout.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        const match = trimmed.match(/^(\d+)\s+(.*)$/);
-        if (!match) continue;
-
-        const pid = Number(match[1]);
-        const command = match[2];
-        if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) continue;
-        if (!command.includes("Google Chrome.app/Contents/MacOS/Google Chrome")) continue;
-        if (!command.includes(userDataArg)) continue;
-        pids.add(pid);
-      }
-
-      return Array.from(pids);
-    } catch (e: any) {
-      this.logger.debug(`Failed to inspect Chrome processes for lock recovery: ${e?.message || String(e)}`);
-      return [];
-    }
-  }
-
-  private isProcessAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      if (!this.isProcessAlive(pid)) return true;
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-    return !this.isProcessAlive(pid);
-  }
-
-  private async terminateLockedProfileChromeProcesses(profileSelection: BrowserProfileSelection): Promise<number> {
-    const pids = await this.listLockedProfileChromePids(profileSelection);
-    if (pids.length === 0) return 0;
-
-    let terminated = 0;
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGTERM");
-      } catch (e: any) {
-        this.logger.debug(`Failed SIGTERM for Chrome pid ${pid}: ${e?.message || String(e)}`);
-        continue;
-      }
-
-      const exitedAfterTerm = await this.waitForProcessExit(pid, 1_500);
-      if (exitedAfterTerm) {
-        terminated += 1;
-        continue;
-      }
-
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch (e: any) {
-        this.logger.debug(`Failed SIGKILL for Chrome pid ${pid}: ${e?.message || String(e)}`);
-        continue;
-      }
-
-      const exitedAfterKill = await this.waitForProcessExit(pid, 1_000);
-      if (exitedAfterKill) {
-        terminated += 1;
-      }
-    }
-
-    return terminated;
-  }
-
-  private async launchPlaywrightPersistentContext(chromium: any, profileSelection: BrowserProfileSelection): Promise<any> {
+  private async launchPlaywrightPersistentContext(chromium: any, profileSelection: BrowserProfileSelection, budget: RequestBudget): Promise<any> {
     return await chromium.launchPersistentContext(profileSelection.userDataDir, {
       channel: "chrome",
+      timeout: budget.remainingMs(),
       headless: false,
       viewport: { width: 1366, height: 900 },
       args: [`--profile-directory=${profileSelection.profileDirectory}`],
@@ -528,17 +532,19 @@ export class BrowserFallbackClient {
 
   private async createPlaywrightSession(
     key: string,
-    profileSelection: BrowserProfileSelection
+    profileSelection: BrowserProfileSelection,
+    budget: RequestBudget
   ): Promise<PlaywrightSession> {
     let playwright: any;
     try {
-      playwright = await this.playwrightModuleLoader();
+      playwright = await this.waitForResource(this.playwrightModuleLoader(), budget, async () => undefined);
     } catch (e: any) {
       throw new Error(
         `Playwright is not installed. Install with: npm i playwright (macOS only for browser fallback). Details: ${e?.message || e}`
       );
     }
 
+    budget.remainingMs();
     const chromium = playwright?.chromium;
     if (!chromium?.launchPersistentContext) {
       throw new Error("Playwright chromium launcher is unavailable for browser fallback");
@@ -546,21 +552,13 @@ export class BrowserFallbackClient {
 
     let context: any;
     try {
-      context = await this.launchPlaywrightPersistentContext(chromium, profileSelection);
-    } catch (e: any) {
-      if (!this.isProfileSingletonLockError(e)) {
-        throw e;
+      context = await this.waitForResource(this.launchPlaywrightPersistentContext(chromium, profileSelection, budget), budget, context => context.close());
+    } catch (error) {
+      budget.remainingMs();
+      if (this.isProfileSingletonLockError(error)) {
+        throw new Error("Browser profile is in use. Close its Chrome window before retrying; Nitan will not terminate an existing browser.");
       }
-
-      const terminated = await this.terminateLockedProfileChromeProcesses(profileSelection);
-      if (terminated <= 0) {
-        throw e;
-      }
-
-      this.logger.info(
-        `Recovered locked Chrome profile '${profileSelection.profileDirectory}' by terminating ${terminated} process(es), retrying launch`
-      );
-      context = await this.launchPlaywrightPersistentContext(chromium, profileSelection);
+      throw error;
     }
 
     return {
@@ -569,7 +567,9 @@ export class BrowserFallbackClient {
     };
   }
 
-  private async getOrCreatePlaywrightSession(profileSelection: BrowserProfileSelection): Promise<PlaywrightSession> {
+  private async getOrCreatePlaywrightSession(profileSelection: BrowserProfileSelection, budget: RequestBudget): Promise<PlaywrightSession> {
+    budget.remainingMs();
+    if (this.disposed) throw new Error("Browser fallback client has been disposed");
     const key = this.buildPlaywrightSessionKey(profileSelection);
 
     if (this.playwrightSession?.key === key && this.isContextUsable(this.playwrightSession.context)) {
@@ -580,22 +580,17 @@ export class BrowserFallbackClient {
       await this.closePlaywrightSession();
     }
 
-    if (this.creatingPlaywrightSession) {
-      try {
-        const pending = await this.creatingPlaywrightSession;
-        if (pending.key === key && this.isContextUsable(pending.context)) {
-          this.playwrightSession = pending;
-          return pending;
-        }
-      } catch (pendingError: any) {
-        this.logger.debug(`Pending Playwright session reuse skipped: ${pendingError?.message || String(pendingError)}`);
-      }
-    }
-
-    const creation = this.createPlaywrightSession(key, profileSelection);
+    budget.remainingMs();
+    const generation = this.sessionGeneration;
+    const creation = this.createPlaywrightSession(key, profileSelection, budget);
     this.creatingPlaywrightSession = creation;
     try {
       const created = await creation;
+      if (generation !== this.sessionGeneration || this.disposed || budget.signal.aborted) {
+        await created.context.close().catch(() => this.logCleanupFailure());
+        budget.remainingMs();
+        throw new DOMException("Browser session was closed", "AbortError");
+      }
       this.playwrightSession = created;
       return created;
     } finally {
@@ -605,7 +600,8 @@ export class BrowserFallbackClient {
     }
   }
 
-  private async getOrCreatePlaywrightPage(session: PlaywrightSession): Promise<any> {
+  private async getOrCreatePlaywrightPage(session: PlaywrightSession, budget: RequestBudget): Promise<any> {
+    budget.remainingMs();
     if (this.isPageUsable(session.page)) {
       return session.page;
     }
@@ -617,20 +613,25 @@ export class BrowserFallbackClient {
       return reusablePage;
     }
 
-    const newPage = await session.context.newPage();
+    const newPage = await this.waitForResource(session.context.newPage(), budget, (page: any) => page.close());
+    budget.remainingMs();
     session.page = newPage;
     return newPage;
   }
 
-  private async readPlaywrightGetBody(response: any, page: any): Promise<string> {
+  private async readPlaywrightGetBody(response: any, page: any, budget: RequestBudget): Promise<string> {
     if (response && typeof response.text === "function") {
       try {
-        return await response.text();
-      } catch {
-      }
+        const body = await response.text();
+        budget.remainingMs();
+        return body;
+      } catch { budget.remainingMs(); }
     }
 
-    return await page.content();
+    budget.remainingMs();
+    const body = await page.content();
+    budget.remainingMs();
+    return body;
   }
 
   private isChallengeLikeResponse(response: BrowserResponse): boolean {
@@ -650,6 +651,7 @@ export class BrowserFallbackClient {
     response: BrowserResponse
   ): boolean {
     return (
+      !isRateLimited(response.status, response.body) &&
       input.method.toUpperCase() === "GET" &&
       profileSelection.source === "nitan" &&
       !this.options.loginProfileName &&
@@ -657,15 +659,26 @@ export class BrowserFallbackClient {
     );
   }
 
-  private async requestViaPlaywrightPage(page: any, input: BrowserRequest): Promise<BrowserResponse> {
+  private assertPageWithinSite(page: any, siteBase: string): void {
+    if (typeof page.url !== "function" || !isUrlWithinSite(page.url(), siteBase)) throw new BrowserSiteBoundaryError();
+  }
+
+  private async requestViaPlaywrightPage(page: any, input: BrowserRequest, budget: RequestBudget): Promise<BrowserResponse> {
+    budget.remainingMs();
     const hasCustomHeaders = Boolean(input.headers && Object.keys(input.headers).length > 0);
     if (input.method.toUpperCase() !== "GET" || hasCustomHeaders) {
       const targetOrigin = new URL(input.url).origin;
       const currentUrl = typeof page.url === "function" ? page.url() : "about:blank";
-      if (!currentUrl || currentUrl === "about:blank" || !currentUrl.startsWith(targetOrigin)) {
-        await page.goto(targetOrigin, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
+      if (!currentUrl || !isUrlWithinSite(currentUrl, input.siteBase ?? targetOrigin)) {
+        const navigation = await page.goto(input.siteBase ?? targetOrigin, { waitUntil: "domcontentloaded", timeout: budget.remainingMs() });
+        if (navigation) {
+          const navigationBody = await this.safeResponseBody(navigation);
+          recordRateLimit(targetOrigin, navigation.status(), navigation.headers?.(), navigationBody);
+        }
       }
 
+      budget.remainingMs();
+      this.assertPageWithinSite(page, input.siteBase ?? targetOrigin);
       const payload = await page.evaluate(async (req: any) => {
         const fetchResp = await fetch(req.url, {
           method: req.method,
@@ -673,7 +686,7 @@ export class BrowserFallbackClient {
           body: req.body,
           credentials: "include",
         });
-        const text = await fetchResp.text();
+        const text = await fetchResp.text().catch(() => "");
         const hdrs: Record<string, string> = {};
         fetchResp.headers.forEach((value, key) => {
           hdrs[key] = value;
@@ -690,11 +703,16 @@ export class BrowserFallbackClient {
         headers: input.headers || {},
         body: input.body,
       });
+      budget.remainingMs();
       return payload;
     }
 
-    const response = await page.goto(input.url, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
-    const content = await this.readPlaywrightGetBody(response, page);
+    const response = await page.goto(input.url, { waitUntil: "domcontentloaded", timeout: budget.remainingMs() });
+    if (response) recordRateLimit(new URL(input.url).origin, response.status(), response.headers?.(), await this.safeResponseBody(response));
+    budget.remainingMs();
+    this.assertPageWithinSite(page, input.siteBase ?? new URL(input.url).origin);
+    const content = await this.readPlaywrightGetBody(response, page, budget);
+    budget.remainingMs();
     const status = response?.status() ?? 0;
     const headers = response?.headers?.() ?? {};
     const finalUrl = page.url();
@@ -711,15 +729,17 @@ export class BrowserFallbackClient {
     return Boolean(this.options.enabled);
   }
 
-  async request(input: BrowserRequest): Promise<BrowserResponse> {
-    const provider = this.options.provider ?? getDefaultBrowserFallbackProvider();
-    if (provider === "openclaw_proxy") {
-      return this.requestViaOpenClawRelay(input);
-    }
-    if (provider === "playwright") {
-      return this.requestViaPlaywright(input);
-    }
-    throw new Error(`Browser fallback provider not implemented: ${provider}`);
+  async request(input: BrowserRequest, options: BrowserOperationOptions = {}): Promise<BrowserResponse> {
+    return this.runWithBudget(options, async budget => {
+      const siteBase = normalizeSiteBase(input.siteBase ?? new URL(input.url).origin);
+      if (!isUrlWithinSite(input.url, siteBase)) throw new Error("Request URL is outside the configured site");
+      input = { ...input, siteBase };
+      assertNotCoolingDown(new URL(input.url).origin);
+      const provider = this.options.provider ?? getDefaultBrowserFallbackProvider();
+      if (provider === "openclaw_proxy") return this.requestViaOpenClawRelay(input, budget);
+      if (provider === "playwright") return this.requestViaPlaywright(input, budget);
+      throw new Error(`Browser fallback provider not implemented: ${provider}`);
+    });
   }
 
   private getOpenClawRelayCdpUrl(): string {
@@ -735,10 +755,12 @@ export class BrowserFallbackClient {
     ].join(" ");
   }
 
-  private async probeOpenClawRelay(cdpUrl: string): Promise<{ reachable: boolean; hasAttachedTab: boolean; reason?: string }> {
+  private async probeOpenClawRelay(cdpUrl: string, budget: RequestBudget): Promise<{ reachable: boolean; hasAttachedTab: boolean; reason?: string }> {
     const normalized = cdpUrl.replace(/\/+$/, "");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.min(this.timeoutMs, 5000));
+    const abort = () => controller.abort();
+    budget.signal.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(abort, Math.min(budget.remainingMs(), 5000));
 
     try {
       const response = await fetch(`${normalized}/json/list`, { signal: controller.signal });
@@ -754,159 +776,121 @@ export class BrowserFallbackClient {
       const pageTargets = payload.filter((entry) => entry?.type === "page" || Boolean(entry?.webSocketDebuggerUrl));
       return { reachable: true, hasAttachedTab: pageTargets.length > 0 };
     } catch (e: any) {
+      budget.remainingMs();
       const reason = e?.name === "AbortError" ? "relay_probe_timeout" : e?.message || String(e);
       return { reachable: false, hasAttachedTab: false, reason };
     } finally {
       clearTimeout(timeout);
+      budget.signal.removeEventListener("abort", abort);
     }
   }
 
-  private async requestViaOpenClawRelay(input: BrowserRequest): Promise<BrowserResponse> {
+  private async requestViaOpenClawRelay(input: BrowserRequest, budget: RequestBudget): Promise<BrowserResponse> {
     const cdpUrl = this.getOpenClawRelayCdpUrl();
-    const probe = await this.probeOpenClawRelay(cdpUrl);
-    if (!probe.reachable) {
-      throw new BrowserFallbackRelayUnavailableError(this.buildOpenClawRelayUnavailableMessage(cdpUrl, probe.reason));
+    const probe = await this.probeOpenClawRelay(cdpUrl, budget);
+    budget.remainingMs();
+    if (!probe.reachable || !probe.hasAttachedTab) {
+      throw new BrowserFallbackRelayUnavailableError(this.buildOpenClawRelayUnavailableMessage(cdpUrl, probe.reason || "no_attached_tab_detected"));
     }
-    if (!probe.hasAttachedTab) {
-      throw new BrowserFallbackRelayUnavailableError(
-        this.buildOpenClawRelayUnavailableMessage(cdpUrl, "no_attached_tab_detected")
-      );
-    }
-
-    let playwright: any;
-    try {
-      const dynamicImport = new Function("m", "return import(m)") as (m: string) => Promise<any>;
-      playwright = await dynamicImport("playwright");
-    } catch (e: any) {
-      throw new Error(`Playwright is required for OpenClaw relay CDP mode. Install with: npm i playwright. Details: ${e?.message || e}`);
-    }
-
+    const playwright = await this.waitForResource(this.playwrightModuleLoader(), budget, async () => undefined);
+    budget.remainingMs();
     let browser: any;
+    try { browser = await this.waitForResource(playwright.chromium.connectOverCDP(cdpUrl, { timeout: budget.remainingMs() }), budget, (browser: any) => browser.close()); }
+    catch { budget.remainingMs(); throw new BrowserFallbackRelayUnavailableError(this.buildOpenClawRelayUnavailableMessage(cdpUrl, "connection_failed")); }
+    let page: any;
+    let closing: Promise<void> | undefined;
+    const closePage = () => { if (page) closing ??= Promise.resolve().then(() => page.close()).catch(() => this.logCleanupFailure()); };
+    budget.signal.addEventListener("abort", closePage, { once: true });
     try {
-      browser = await playwright.chromium.connectOverCDP(cdpUrl, {
-        timeout: this.timeoutMs,
-      });
-    } catch (e: any) {
-      throw new BrowserFallbackRelayUnavailableError(
-        this.buildOpenClawRelayUnavailableMessage(cdpUrl, e?.message || String(e))
-      );
-    }
-
-    try {
+      budget.remainingMs();
       const context = browser.contexts?.()[0];
-      const page = context?.pages?.()[0];
-      if (!context || !page) {
-        throw new BrowserFallbackRelayUnavailableError(
-          this.buildOpenClawRelayUnavailableMessage(cdpUrl, "no_attached_tab_detected")
-        );
-      }
-
-      const response = await page.goto(input.url, { waitUntil: "domcontentloaded", timeout: this.timeoutMs });
-      const content = await this.readPlaywrightGetBody(response, page);
-      const status = response?.status() ?? 0;
-      const headers = response?.headers?.() ?? {};
-      const finalUrl = page.url();
-
-      if (input.method.toUpperCase() !== "GET") {
-        const payload = await page.evaluate(async (req: any) => {
-          const fetchResp = await fetch(req.url, {
-            method: req.method,
-            headers: req.headers,
-            body: req.body,
-            credentials: "include",
-          });
-          const text = await fetchResp.text();
-          const hdrs: Record<string, string> = {};
-          fetchResp.headers.forEach((value, key) => {
-            hdrs[key] = value;
-          });
-          return {
-            status: fetchResp.status,
-            body: text,
-            headers: hdrs,
-            finalUrl: fetchResp.url,
-          };
-        }, {
-          url: input.url,
-          method: input.method,
-          headers: input.headers || {},
-          body: input.body,
-        });
-        return payload;
-      }
-
-      return {
-        status,
-        body: content,
-        headers,
-        finalUrl,
-      };
+      if (!context?.newPage) throw new BrowserFallbackRelayUnavailableError("Relay must support a dedicated request tab; use playwright fallback instead.");
+      try { page = await this.waitForResource(context.newPage(), budget, (page: any) => page.close()); }
+      catch { throw new BrowserFallbackRelayUnavailableError("Relay cannot create a dedicated request tab; use playwright fallback instead."); }
+      budget.remainingMs();
+      const response = await this.requestViaPlaywrightPage(page, input, budget);
+      budget.remainingMs();
+      recordRateLimit(new URL(input.url).origin, response.status, response.headers, response.body);
+      return response;
     } finally {
-      await browser.close();
+      budget.signal.removeEventListener("abort", closePage);
+      closePage();
+      await closing;
+      // connectOverCDP's Browser.close disconnects this client, not the user's
+      // externally launched Chrome. Never close a borrowed context or tab.
+      await browser.close().catch(() => this.logCleanupFailure());
     }
   }
 
-  private async requestViaPlaywright(input: BrowserRequest): Promise<BrowserResponse> {
+  private async requestViaPlaywright(input: BrowserRequest, budget: RequestBudget): Promise<BrowserResponse> {
     const profileSelection = this.resolvePlaywrightProfileSelection();
     try {
-      const session = await this.getOrCreatePlaywrightSession(profileSelection);
-      const page = await this.getOrCreatePlaywrightPage(session);
-      let response = await this.requestViaPlaywrightPage(page, input);
+      const session = await this.getOrCreatePlaywrightSession(profileSelection, budget);
+      const page = await this.getOrCreatePlaywrightPage(session, budget);
+      let response = await this.requestViaPlaywrightPage(page, input, budget);
+      recordRateLimit(new URL(input.url).origin, response.status, response.headers, response.body);
       if (
         this.shouldRetryWithClearedManagedCookies(profileSelection, input, response) &&
         typeof session.context.clearCookies === "function"
       ) {
+        budget.remainingMs();
         await session.context.clearCookies();
-        response = await this.requestViaPlaywrightPage(page, input);
+        budget.remainingMs();
+        response = await this.requestViaPlaywrightPage(page, input, budget);
       }
       return response;
     } catch (e: any) {
+      budget.remainingMs();
       if (!this.isRetryablePlaywrightSessionError(e)) {
         throw e;
       }
 
       await this.closePlaywrightSession();
-      const freshSession = await this.getOrCreatePlaywrightSession(profileSelection);
-      const freshPage = await this.getOrCreatePlaywrightPage(freshSession);
-      let response = await this.requestViaPlaywrightPage(freshPage, input);
+      const freshSession = await this.getOrCreatePlaywrightSession(profileSelection, budget);
+      const freshPage = await this.getOrCreatePlaywrightPage(freshSession, budget);
+      let response = await this.requestViaPlaywrightPage(freshPage, input, budget);
+      recordRateLimit(new URL(input.url).origin, response.status, response.headers, response.body);
       if (
         this.shouldRetryWithClearedManagedCookies(profileSelection, input, response) &&
         typeof freshSession.context.clearCookies === "function"
       ) {
+        budget.remainingMs();
         await freshSession.context.clearCookies();
-        response = await this.requestViaPlaywrightPage(freshPage, input);
+        budget.remainingMs();
+        response = await this.requestViaPlaywrightPage(freshPage, input, budget);
       }
       return response;
     }
   }
 
-  async maybePromptInteractiveLogin(siteUrl: string): Promise<void> {
+  async maybePromptInteractiveLogin(siteUrl: string, options: BrowserOperationOptions = {}): Promise<void> {
     if (!this.options.interactiveLoginEnabled) return;
     if (process.platform !== "darwin") {
       throw new Error("interactive_login_not_supported_on_platform");
     }
 
-    const profileSelection = this.resolvePlaywrightProfileSelection();
-    const url = this.options.loginCheckUrl || siteUrl;
+    return this.runWithBudget(options, async budget => {
+      const siteBase = normalizeSiteBase(siteUrl);
+      const url = this.options.loginCheckUrl || siteBase;
+      if (!isUrlWithinSite(url, siteBase)) throw new BrowserSiteBoundaryError("Login URL is outside the configured site");
+      const profileSelection = this.resolvePlaywrightProfileSelection();
 
-    await this.openChromeOnMac(
-      [
-        "-na",
-        "Google Chrome",
-        "--args",
-        `--user-data-dir=${profileSelection.userDataDir}`,
-        `--profile-directory=${profileSelection.profileDirectory}`,
-      ],
-      `Failed to open Chrome profile '${profileSelection.profileDirectory}'`
-    );
+      await this.openChromeOnMac(
+        [
+          "-na",
+          "Google Chrome",
+          "--args",
+          `--user-data-dir=${profileSelection.userDataDir}`,
+          `--profile-directory=${profileSelection.profileDirectory}`,
+        ],
+        `Failed to open Chrome profile '${profileSelection.profileDirectory}'`, budget
+      );
 
-    await this.openUrlInFrontChromeTabOnMac(url);
+      await this.openUrlInFrontChromeTabOnMac(url, budget);
 
-    this.logger.info(
-      `Interactive login required. Opened Chrome profile '${profileSelection.profileDirectory}' using ${profileSelection.source} user-data-dir at ${url}`
-    );
-    throw new Error(
-      `Interactive login required: Chrome profile '${profileSelection.profileDirectory}' has been opened with ${profileSelection.source} user-data-dir. Please login to uscardforum in that window, then retry.`
-    );
+      throw new Error(
+        `Interactive login required: Chrome profile '${profileSelection.profileDirectory}' has been opened with ${profileSelection.source} user-data-dir. Please login to uscardforum in that window, then retry.`
+      );
+    });
   }
 }
