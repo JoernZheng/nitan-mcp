@@ -46,5 +46,9 @@ Use wrappers for isolated calls, persistent collection for bulk work. Confirm
 any opted-in package comes from the intended fork; `@nitansde/mcp` on npm belongs
 to upstream. Do not rely on private development paths.
 
-For current parameters and coverage see [TOOLS.md](../../TOOLS.md); installation,
-CLI examples and exit meanings are in [README.md](../../README.md).
+Bare `nitan-mcp` commands require an installed/linked binary from this fork.
+After a source build, use `node /absolute/path/to/fork/dist/index.js collect`
+and the same entrypoint for local reading.
+
+For parameters and coverage see [TOOLS.md](https://github.com/JoernZheng/nitan-mcp/blob/main/TOOLS.md);
+installation and examples are in [README.md](https://github.com/JoernZheng/nitan-mcp/blob/main/README.md).

@@ -5,7 +5,7 @@
 This is a small personal, read-only server for uscardforum.com. Retain the
 site/auth/Python/browser adaptation and avoid admin/workflow/remote frameworks,
 new databases, schedulers or services. Read current
-`docs/maintenance/delivery-plan.md` and `upstream-assessment.md` before changes.
+`docs/maintenance/delivery-plan.md` and `docs/maintenance/upstream-assessment.md` before changes.
 Use one implementation writer; auxiliary agents review read-only snapshots.
 Preserve unrelated work and stage exact files only. Update accepted decisions
 and current validation, then make coherent local commits. Publication/config

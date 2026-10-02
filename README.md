@@ -68,12 +68,13 @@ Open the printed URL, authorize, then complete with the encrypted payload.
 The pending file contains private key material; keep it private. The server
 loads its platform profile automatically: macOS `~/Library/Application Support/NitanMCP/profile.json`,
 Linux `${XDG_CONFIG_HOME:-~/.config}/nitan-mcp/profile.json`, Windows
-`%APPDATA%\NitanMCP\profile.json`. Successful completion removes the pending file.
+`%APPDATA%\NitanMCP\profile.json`. Successful completion attempts to remove the pending file; check and safely
+remove it if cleanup fails.
 
 ## Tools
 
-Nine read-only tools are exposed when `--site` is set. Without it,
-`discourse_select_site` is also available. No posting, deletion or admin tools.
+The CLI defaults to uscardforum.com and exposes nine read-only tools.
+No posting, deletion or admin tools.
 
 | Tool | Purpose |
 | --- | --- |
@@ -128,7 +129,7 @@ its recorded PID exited. Content and cursors commit together via atomic rename.
   Override with `--request-interval-ms` (500–60,000 ms) for bounded workloads.
 - 429/confirmed 1015 stops fallback/retry cascades. Cooldown uses server hints,
   or 60 seconds when none are parseable; collection persists it across runs.
-- Topic reads default to 90 posts (max 500), 32 logical requests and a 262 KiB
+- Topic reads default to 90 posts (max 500), 32 logical requests and a 256 KiB
   result budget. Compact output avoids duplicate text. Never advance past a
   post that was not returned; follow `next_post_number`.
 - Raw timestamps describe edits. Creation time may be unknown. Truncated bodies,

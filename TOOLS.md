@@ -1,8 +1,9 @@
 # Tool reference
 
-The tethered server exposes nine read-only tools. Without `--site`,
-`discourse_select_site` accepts a site URL as well. The running tool schema is
-canonical; disabled source files are not available tools.
+The CLI defaults to uscardforum.com and exposes nine read-only tools.
+Untethered programmatic registration can add `discourse_select_site`; simply
+omitting the CLI site flag does not untether it. The running schema is canonical;
+disabled source files are not available tools.
 
 ## Discovery
 
