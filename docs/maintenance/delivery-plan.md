@@ -42,3 +42,12 @@ PR publication, upstream contributions or unrelated configuration changes.
 For future changes: use one writer, read-only auxiliary review, scoped checks,
 update this status and commit coherent changes. Public messages need their own
 authorization. Never commit credentials, profiles, forum dumps or machine logs.
+
+## Closeout completed
+
+Sanitized implementation and reviewed documentation are merged and pushed to
+the fork main. The maintained runtime is installed outside the checkout; the
+local MCP entry keeps existing credentials and uses an independent Node/Python
+runtime. Old installation/processes were removed; reading/checkpoint records
+were retained locally. Activation registered nine read-only tools with zero
+forum requests. No additional live tests or npm publication were performed.
